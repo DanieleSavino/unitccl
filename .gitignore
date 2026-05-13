@@ -1,6 +1,7 @@
 # build artifacts
 build/
 .cache/
+compile_commands.json
 
 # python
 __pycache__/

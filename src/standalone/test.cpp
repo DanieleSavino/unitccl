@@ -1,5 +1,8 @@
+#include <cstddef>
+extern "C" {
 #include "fastest/custom_tests.h"
 #include "fastest/tests.h"
+}
 
 FASTEST_CUSTOMTEST_INLINE("standalone/1", FASTEST_TIME_NS, NULL, {
     out->exit_status |= FASTEST_ERROR_ASSERT;

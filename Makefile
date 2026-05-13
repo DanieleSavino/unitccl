@@ -6,16 +6,17 @@ CUDA_HOME    ?= /usr/local/cuda
 
 NCCL_LIB := $(NCCL_ROOT)/build/lib/libnccl_static.a
 
-CC      := gcc
+CC      := g++
 AR      := ar
-CFLAGS  := -std=c11 -fPIC -D_POSIX_C_SOURCE=199309L -I$(FASTEST_ROOT)/include
+
+CFLAGS  := -std=c++17 -fPIC -I$(FASTEST_ROOT)/include
 
 ifneq ($(wildcard $(NCCL_LIB)),)
-  CFLAGS += -I$(NCCL_ROOT)/build/include -I$(CUDA_HOME)/include -DHAVE_NCCL
+  CFLAGS += -I$(NCCL_ROOT)/build/include -I$(NCCL_ROOT)/src/include -I$(CUDA_HOME)/include -DHAVE_NCCL
 endif
 
-SRCS := $(shell find src -name '*.c')
-OBJS := $(SRCS:src/%.c=build/%.o)
+SRCS := $(shell find src -name '*.cpp')
+OBJS := $(SRCS:src/%.cpp=build/%.o)
 LIB  := build/libunitccl.a
 
 all: $(LIB)
@@ -23,7 +24,7 @@ all: $(LIB)
 $(LIB): $(OBJS)
 	$(AR) rcs $@ $^
 
-build/%.o: src/%.c
+build/%.o: src/%.cpp
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $@
 
