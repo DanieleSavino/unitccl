@@ -1,0 +1,6 @@
+[submodule "nccl"]
+	path = nccl
+	url = https://github.com/danielesavino/nccl
+[submodule "vendor/fastest"]
+	path = vendor/fastest
+	url = https://github.com/danielesavino/fastest
