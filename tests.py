@@ -19,8 +19,8 @@ if run_standalone:
 
 if run_scaling:
     print(color("\n── scaling comparison ──────────────────────────────────────────────", sep_color))
-    bine_bcast = fastest.pool_from_prefix("scaling/bine_bcast")
-    ring_bcast  = fastest.pool_from_prefix("scaling/ring_bcast")
+    bine_bcast = fastest.pool_from_prefix("scaling/BINE_bcast")
+    ring_bcast  = fastest.pool_from_prefix("scaling/RING_bcast")
     cmp = fastest.compare(bine_bcast, ring_bcast, n_repeats=5)
     cmp.report()
 

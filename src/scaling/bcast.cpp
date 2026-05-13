@@ -1,12 +1,12 @@
+#include "fastest/tests.h"
+extern "C" {
+#include "fastest/custom_tests.h"
+}
 #include "nccl.h"
 #include <cuda_runtime.h>
 #include <cstdlib>
 #include <cstdint>
 #include <time.h>
-
-extern "C" {
-#include "fastest/custom_tests.h"
-}
 
 #define NRANKS 4
 
