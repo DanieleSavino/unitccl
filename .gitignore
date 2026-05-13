@@ -1,0 +1,17 @@
+# build artifacts
+build/
+.cache/
+
+# python
+__pycache__/
+*.pyc
+*.egg-info/
+
+# pybind extension (built locally)
+vendor/fastest/bindings/*.so
+vendor/fastest/bindings/build/
+vendor/fastest/bindings/dist/
+
+# editor
+.vscode/
+*.swp
