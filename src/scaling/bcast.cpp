@@ -54,18 +54,18 @@ done:
     return 0;
 }
 
-#define DEFINE_BENCH_TEST(coll, algo, idx, nbytes)                    \
-FASTEST_CUSTOMTEST_INLINE("scaling/" algo "_" coll "/" #idx,          \
+#define DEFINE_BENCH_TEST(coll, algo, name, nbytes)                    \
+FASTEST_CUSTOMTEST_INLINE("scaling/" algo "_" coll "/" name,          \
                            FASTEST_FAIL_ERROR, NULL,                                  \
 { run_bench(coll, algo, nbytes, out); })
 
-DEFINE_BENCH_TEST("bcast", "BINE", 0, 1024)
-DEFINE_BENCH_TEST("bcast", "BINE", 1, 16 * 1024)
-DEFINE_BENCH_TEST("bcast", "BINE", 2, 256 * 1024)
-DEFINE_BENCH_TEST("bcast", "BINE", 3, 4 * 1024 * 1024)
-DEFINE_BENCH_TEST("bcast", "BINE", 4, 64 * 1024 * 1024)
-DEFINE_BENCH_TEST("bcast", "RING", 0, 1024)
-DEFINE_BENCH_TEST("bcast", "RING", 1, 16 * 1024)
-DEFINE_BENCH_TEST("bcast", "RING", 2, 256 * 1024)
-DEFINE_BENCH_TEST("bcast", "RING", 3, 4 * 1024 * 1024)
-DEFINE_BENCH_TEST("bcast", "RING", 4, 64 * 1024 * 1024)
+DEFINE_BENCH_TEST("bcast", "BINE", "1kB", 1024)
+DEFINE_BENCH_TEST("bcast", "BINE", "4kB", 16 * 1024)
+DEFINE_BENCH_TEST("bcast", "BINE", "256kB", 256 * 1024)
+DEFINE_BENCH_TEST("bcast", "BINE", "4MB", 4 * 1024 * 1024)
+DEFINE_BENCH_TEST("bcast", "BINE", "64MB", 64 * 1024 * 1024)
+DEFINE_BENCH_TEST("bcast", "RING", "1kB", 1024)
+DEFINE_BENCH_TEST("bcast", "RING", "16kB", 16 * 1024)
+DEFINE_BENCH_TEST("bcast", "RING", "256kB", 256 * 1024)
+DEFINE_BENCH_TEST("bcast", "RING", "4MB", 4 * 1024 * 1024)
+DEFINE_BENCH_TEST("bcast", "RING", "64MB", 64 * 1024 * 1024)
