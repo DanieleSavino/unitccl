@@ -12,7 +12,7 @@ AR      := ar
 CFLAGS  := -std=c++17 -fPIC -I$(FASTEST_ROOT)/include
 
 ifneq ($(wildcard $(NCCL_LIB)),)
-  CFLAGS += -I$(NCCL_ROOT)/build/include -I$(NCCL_ROOT)/src/include -I$(CUDA_HOME)/include -DHAVE_NCCL
+  CFLAGS += -I$(NCCL_ROOT)/build/include -I$(NCCL_ROOT)/src/include -I$(NCCL_ROOT)/src -I$(CUDA_HOME)/include -DHAVE_NCCL
 endif
 
 SRCS := $(shell find src -name '*.cpp')
@@ -26,7 +26,7 @@ $(LIB): $(OBJS)
 
 build/%.o: src/%.cpp
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) -Iinclude -c $< -o $@
 
 clean:
 	rm -rf build/

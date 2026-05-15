@@ -16,3 +16,5 @@ vendor/fastest/bindings/dist/
 # editor
 .vscode/
 *.swp
+
+logs/

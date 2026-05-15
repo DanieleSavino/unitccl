@@ -3,6 +3,7 @@
 FASTEST_HOME="$(realpath vendor/fastest)"
 
 export FASTEST_EXTRA_LIBS="$(realpath nccl/build/lib/libnccl_static.a) -latomic -lcudart"
+export FASTEST_EXTRA_COMPILE_ARGS="-std=c++17"
 
 name=$(basename "$PWD")
 
