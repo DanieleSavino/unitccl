@@ -1,83 +1,71 @@
-#include "fastest/tests.h"
 extern "C" {
+#include "fastest/tests.h"
 #include "fastest/custom_tests.h"
 }
-#include "nccl.h"
-#include <cuda_runtime.h>
 #include <cstdlib>
 #include <cstdint>
-#include <time.h>
+#include <cstdio>
+#include <cstring>
 
-#define NRANKS 4
-
-static inline uint64_t now_ns() {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+static int run_bench(const char *coll, const char *algo, size_t nbytes,
+                     FASTEST_TestOutput_t *out) {
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd),
+             "mpirun build/unitccl_bench %s %s %zu 2>&1",
+             coll, algo, nbytes / sizeof(float));
+    FILE *fp = popen(cmd, "r");
+    if (!fp) {
+        fprintf(stderr, "[bench] popen failed\n");
+        out->exit_status = FASTEST_ERROR_RESOURCE;
+        return -1;
+    }
+    char     line[256];
+    int      got_status = 0, got_median = 0, success = 0;
+    uint64_t median_ns = 0;
+    while (fgets(line, sizeof(line), fp)) {
+        fprintf(stderr, "[bench] %s", line);
+        if (strncmp(line, "status:", 7) == 0) {
+            got_status = 1;
+            if      (strstr(line, "success"))      success = 1;
+            else if (strstr(line, "error assert")) { out->exit_status = FASTEST_ERROR_ASSERT;    goto done; }
+            else if (strstr(line, "error cuda"))   { out->exit_status = FASTEST_ERROR_CUDA;      goto done; }
+        }
+        if (strncmp(line, "median:", 7) == 0) {
+            got_median = 1;
+            sscanf(line, "median: %llu ns", (unsigned long long *)&median_ns);
+        }
+    }
+done:
+    int ret = pclose(fp);
+    if (ret != 0) {
+        out->exit_status |= FASTEST_ERROR_RESOURCE;
+        return -1;
+    }
+    if (!got_status || !got_median) {
+        out->exit_status |= FASTEST_ERROR_UNEXPECTED;
+        return -1;
+    }
+    if (!success) {
+        out->exit_status |= FASTEST_ERROR_ASSERT;
+        return -1;
+    }
+    out->time_ns     = median_ns;
+    out->exit_status = FASTEST_SUCCESS;
+    return 0;
 }
 
-static void run_bcast(const char *algo, size_t nbytes, FASTEST_TestOutput_t *out) {
-    setenv("NCCL_ALGO", algo, 1);
-    setenv("NCCL_ALLGATHERV_ENABLE", "0", 1);
+#define DEFINE_BENCH_TEST(coll, algo, idx, nbytes)                    \
+FASTEST_CUSTOMTEST_INLINE("scaling/" algo "_" coll "/" #idx,          \
+                           FASTEST_FAIL_ERROR, NULL,                                  \
+{ run_bench(coll, algo, nbytes, out); })
 
-    ncclComm_t   comms[NRANKS];
-    void        *sendbuf[NRANKS], *recvbuf[NRANKS];
-    cudaStream_t streams[NRANKS];
-    int          devs[NRANKS] = {0, 1, 2, 3};
-
-    for (int i = 0; i < NRANKS; i++) {
-        cudaSetDevice(i);
-        cudaMalloc(&sendbuf[i], nbytes);
-        cudaMalloc(&recvbuf[i], nbytes);
-        cudaStreamCreate(&streams[i]);
-    }
-    ncclCommInitAll(comms, NRANKS, devs);
-
-    // warmup
-    ncclGroupStart();
-    for (int i = 0; i < NRANKS; i++)
-        ncclBroadcast(sendbuf[i], recvbuf[i], nbytes, ncclChar, 0, comms[i], streams[i]);
-    ncclGroupEnd();
-    for (int i = 0; i < NRANKS; i++) {
-        cudaSetDevice(i);
-        cudaStreamSynchronize(streams[i]);
-    }
-
-    // measured run
-    uint64_t t0 = now_ns();
-    ncclGroupStart();
-    for (int i = 0; i < NRANKS; i++)
-        ncclBroadcast(sendbuf[i], recvbuf[i], nbytes, ncclChar, 0, comms[i], streams[i]);
-    ncclGroupEnd();
-    for (int i = 0; i < NRANKS; i++) {
-        cudaSetDevice(i);
-        cudaStreamSynchronize(streams[i]);
-    }
-    uint64_t t1 = now_ns();
-
-    out->time_ns = t1 - t0;
-
-    for (int i = 0; i < NRANKS; i++) {
-        ncclCommDestroy(comms[i]);
-        cudaFree(sendbuf[i]);
-        cudaFree(recvbuf[i]);
-        cudaStreamDestroy(streams[i]);
-    }
-}
-
-#define DEFINE_BCAST_TEST(algo, idx, nbytes)                          \
-FASTEST_CUSTOMTEST_INLINE("scaling/" algo "_bcast/" #idx,             \
-                           FASTEST_TIME_NS, NULL,                     \
-{ run_bcast(algo, nbytes, out); out->exit_status = FASTEST_SUCCESS; })
-
-DEFINE_BCAST_TEST("BINE", 0, 1024)
-DEFINE_BCAST_TEST("BINE", 1, 16 * 1024)
-DEFINE_BCAST_TEST("BINE", 2, 256 * 1024)
-DEFINE_BCAST_TEST("BINE", 3, 4 * 1024 * 1024)
-DEFINE_BCAST_TEST("BINE", 4, 64 * 1024 * 1024)
-
-DEFINE_BCAST_TEST("RING", 0, 1024)
-DEFINE_BCAST_TEST("RING", 1, 16 * 1024)
-DEFINE_BCAST_TEST("RING", 2, 256 * 1024)
-DEFINE_BCAST_TEST("RING", 3, 4 * 1024 * 1024)
-DEFINE_BCAST_TEST("RING", 4, 64 * 1024 * 1024)
+DEFINE_BENCH_TEST("bcast", "BINE", 0, 1024)
+DEFINE_BENCH_TEST("bcast", "BINE", 1, 16 * 1024)
+DEFINE_BENCH_TEST("bcast", "BINE", 2, 256 * 1024)
+DEFINE_BENCH_TEST("bcast", "BINE", 3, 4 * 1024 * 1024)
+DEFINE_BENCH_TEST("bcast", "BINE", 4, 64 * 1024 * 1024)
+DEFINE_BENCH_TEST("bcast", "RING", 0, 1024)
+DEFINE_BENCH_TEST("bcast", "RING", 1, 16 * 1024)
+DEFINE_BENCH_TEST("bcast", "RING", 2, 256 * 1024)
+DEFINE_BENCH_TEST("bcast", "RING", 3, 4 * 1024 * 1024)
+DEFINE_BENCH_TEST("bcast", "RING", 4, 64 * 1024 * 1024)
