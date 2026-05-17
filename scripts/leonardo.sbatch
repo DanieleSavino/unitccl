@@ -5,6 +5,7 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --gres=gpu:4
 #SBATCH --time=00:30:00
+#SBATCH --exclude=lrdn0724
 #SBATCH -o logs/run.out
 #SBATCH -e logs/run.err
 

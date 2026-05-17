@@ -2,20 +2,27 @@
  * unitccl_bench.cu  —  1 MPI rank per GPU collective benchmark
  *
  * Usage:
- *   NCCL_ALGO=RING mpirun -n 4 ./unitccl_bench bcast 1048576
- *   NCCL_ALGO=BINE mpirun -n 4 ./unitccl_bench bcast 1048576
+ *   NCCL_ALGO=RING mpirun -n 4 ./unitccl_bench Bcast 1048576
+ *   NCCL_ALGO=BINE mpirun -n 4 ./unitccl_bench Bcast 1048576
  *
- * argv: <bcast|allreduce|allgather|reduce> <vec_size_floats>
+ * Correctness check (iteration 0 only):
+ *   UNITCCL_CHECK_BINE=1 NCCL_ALGO=BINE mpirun -n 4 ./unitccl_bench AllReduce 1048576
+ *
+ * argv: <Bcast|AllReduce|AllGather|Reduce> <vec_size_floats>
  *
  * Notes:
  *   - rank i owns GPU i (cudaSetDevice(world_rank))
  *   - ncclCommInitRank via MPI_Bcast of unique ID
+ *   - send buffer fill: send[i] = (rank+1) * i  for every rank and collective;
+ *     using (rank+1) so rank 0 also sends non-zero data
  *   - allgather recv buffer is count*world_size elements — allocated correctly
  *     per rank since every rank participates symmetrically
  *   - timing: cudaEvent pair on the single stream, all ranks sync via
  *     MPI_Barrier before each iteration so we measure the collective cleanly
  *   - stats: each rank computes its own median/min/max; rank 0 gathers and
  *     reports global median (across ranks) and true straggler (global max)
+ *   - correctness: enabled when env UNITCCL_CHECK_BINE=1, checked on iter 0
+ *     only; each rank prints "status: success|error assert|error cuda/nccl"
  */
 
 #include <cstdlib>
@@ -31,6 +38,15 @@
 #define WARMUP  10
 #define ITERS   50
 
+#define CHECK_ENV "UNITCCL_CHECK_BINE"
+
+/* ── status tracking ────────────────────────────────────────────────────── */
+
+typedef enum { STATUS_OK, STATUS_ERROR_ASSERT, STATUS_ERROR_RUNTIME } Status;
+
+/* Per-rank global — set by macros or check, read for the final status line. */
+static Status g_status = STATUS_OK;
+
 /* ── error macros ───────────────────────────────────────────────────────── */
 
 #define CUDA_CHECK(cmd) do {                                               \
@@ -38,6 +54,7 @@
     if (_e != cudaSuccess) {                                               \
         fprintf(stderr, "[rank %d] CUDA %s:%d  %s\n",                     \
                 world_rank, __FILE__, __LINE__, cudaGetErrorString(_e));   \
+        g_status = STATUS_ERROR_RUNTIME;                                   \
         MPI_Abort(MPI_COMM_WORLD, 1);                                      \
     }                                                                      \
 } while (0)
@@ -47,6 +64,7 @@
     if (_r != ncclSuccess) {                                               \
         fprintf(stderr, "[rank %d] NCCL %s:%d  %s\n",                     \
                 world_rank, __FILE__, __LINE__, ncclGetErrorString(_r));   \
+        g_status = STATUS_ERROR_RUNTIME;                                   \
         MPI_Abort(MPI_COMM_WORLD, 1);                                      \
     }                                                                      \
 } while (0)
@@ -62,54 +80,134 @@ static int cmp_float(const void *a, const void *b) {
     return (fa > fb) - (fa < fb);
 }
 
-static void fill_device(float *d, size_t count, float val) {
+/*
+ * Fill device buffer: send[i] = (rank+1) * i.
+ * Using (rank+1) so every rank — including rank 0 — sends non-zero data,
+ * which gives a meaningful correctness signal for all collectives.
+ */
+static void fill_device_ranked(float *d, size_t count, int rank) {
     float *h = (float *)malloc(count * sizeof(float));
     if (!h) { fprintf(stderr, "malloc failed\n"); exit(1); }
-    for (size_t i = 0; i < count; i++) h[i] = val;
+    float scale = (float)(rank + 1);
+    for (size_t i = 0; i < count; i++) h[i] = scale * (float)i;
     cudaMemcpy(d, h, count * sizeof(float), cudaMemcpyHostToDevice);
     free(h);
 }
 
 /* ── collective dispatch ────────────────────────────────────────────────── */
 
-/*
- * send_count: number of floats in d_send (== argv vec_size for all collectives)
- * recv_count: number of floats in d_recv (== send_count * world_size for allgather,
- *             else send_count)
- *
- * For allgather, NCCL expects the per-rank send count, not the total.
- * For reduce/bcast, root is rank 0.
- */
 static void run_coll(CollType coll, size_t send_count,
                      ncclComm_t comm, cudaStream_t stream,
                      float *d_send, float *d_recv,
                      int world_rank) {
     switch (coll) {
         case COLL_BCAST:
-            /* in-place on root (d_recv == d_send on rank 0 is fine;
-             * on non-root ranks d_recv is the destination)            */
             NCCL_CHECK(ncclBroadcast(d_send, d_recv, send_count,
                                      ncclFloat, /*root=*/0, comm, stream));
             break;
-
         case COLL_ALLREDUCE:
             NCCL_CHECK(ncclAllReduce(d_send, d_recv, send_count,
                                      ncclFloat, ncclSum, comm, stream));
             break;
-
         case COLL_ALLGATHER:
-            /* ncclAllGather takes the PER-RANK send count.
-             * d_recv must be world_size * send_count floats.          */
             NCCL_CHECK(ncclAllGather(d_send, d_recv, send_count,
                                      ncclFloat, comm, stream));
             break;
-
         case COLL_REDUCE:
             NCCL_CHECK(ncclReduce(d_send, d_recv, send_count,
                                   ncclFloat, ncclSum, /*root=*/0,
                                   comm, stream));
             break;
     }
+}
+
+/* ── correctness check ──────────────────────────────────────────────────── */
+
+/*
+ * check_correctness — called after iteration 0 when UNITCCL_CHECK_BINE=1.
+ *
+ * All collectives use send[i] = (rank+1)*i, so expected recv values are:
+ *
+ *   Bcast:     recv[i] == (0+1)*i == i
+ *   AllReduce: recv[i] == i * W*(W+1)/2
+ *   AllGather: recv[r*count + i] == (r+1)*i
+ *   Reduce:    recv[i] == i * W*(W+1)/2  (root rank 0 only)
+ */
+static void check_correctness(CollType coll, size_t count,
+                               float *d_recv, int world_rank, int world_size) {
+    size_t recv_count = (coll == COLL_ALLGATHER)
+                        ? count * (size_t)world_size : count;
+
+    float *h = (float *)malloc(recv_count * sizeof(float));
+    if (!h) {
+        fprintf(stderr, "[rank %d] check malloc failed\n", world_rank);
+        g_status = STATUS_ERROR_RUNTIME;
+        return;
+    }
+    cudaMemcpy(h, d_recv, recv_count * sizeof(float), cudaMemcpyDeviceToHost);
+
+    float sum_scales = (float)(world_size * (world_size + 1)) / 2.0f;
+
+    int   first_bad = -1;
+    float got_bad   = 0.f, exp_bad = 0.f;
+
+    switch (coll) {
+
+        case COLL_BCAST:
+            for (size_t i = 0; i < count; i++) {
+                float expected = (float)i;          /* root=0, scale=1 */
+                if (h[i] != expected) {
+                    first_bad = (int)i; got_bad = h[i]; exp_bad = expected;
+                    goto done;
+                }
+            }
+            break;
+
+        case COLL_ALLREDUCE:
+            for (size_t i = 0; i < count; i++) {
+                float expected = (float)i * sum_scales;
+                if (h[i] != expected) {
+                    first_bad = (int)i; got_bad = h[i]; exp_bad = expected;
+                    goto done;
+                }
+            }
+            break;
+
+        case COLL_ALLGATHER:
+            for (int r = 0; r < world_size; r++) {
+                float scale = (float)(r + 1);
+                for (size_t i = 0; i < count; i++) {
+                    float expected = scale * (float)i;
+                    float got      = h[(size_t)r * count + i];
+                    if (got != expected) {
+                        first_bad = (int)((size_t)r * count + i);
+                        got_bad = got; exp_bad = expected;
+                        goto done;
+                    }
+                }
+            }
+            break;
+
+        case COLL_REDUCE:
+            if (world_rank != 0) break;     /* non-root: undefined, skip */
+            for (size_t i = 0; i < count; i++) {
+                float expected = (float)i * sum_scales;
+                if (h[i] != expected) {
+                    first_bad = (int)i; got_bad = h[i]; exp_bad = expected;
+                    goto done;
+                }
+            }
+            break;
+    }
+
+done:
+    if (first_bad >= 0) {
+        fprintf(stderr,
+            "[rank %d] MISMATCH at index %d: got %.6g expected %.6g\n",
+            world_rank, first_bad, (double)got_bad, (double)exp_bad);
+        g_status = STATUS_ERROR_ASSERT;
+    }
+    free(h);
 }
 
 /* ── main ───────────────────────────────────────────────────────────────── */
@@ -119,13 +217,11 @@ int main(int argc, char **argv) {
     MPI_Init(&argc, &argv);
 
     if (argc != 3) {
-        /* print on stderr before MPI init so it always shows */
         fprintf(stderr,
-            "%d args found, usage: NCCL_ALGO=<ALGO> mpirun -n <ngpus> %s"
+            "usage: NCCL_ALGO=<ALGO> mpirun -n <ngpus> %s"
             " <Bcast|AllReduce|AllGather|Reduce> <vec_size_floats>\n",
-            argc, argv[0]);
-
-        fprintf(stderr, "args: %s %s %s %s\n", argv[0], argv[1], argv[2], argv[3]);
+            argv[0]);
+        MPI_Abort(MPI_COMM_WORLD, 1);
         return EXIT_FAILURE;
     }
 
@@ -133,15 +229,20 @@ int main(int argc, char **argv) {
     size_t      count    = (size_t)atoll(argv[2]);
 
     CollType coll;
-    // NCCL Converts Bcast to Scatter + AllGatherv
-    if      (!strcmp(coll_str, "Bcast"))     {coll = COLL_BCAST; setenv("NCCL_ALLGATHERV_ENABLE", "0", 1);}
+    if      (!strcmp(coll_str, "Bcast"))     { coll = COLL_BCAST;
+                                               setenv("NCCL_ALLGATHERV_ENABLE", "0", 1); }
     else if (!strcmp(coll_str, "AllReduce")) coll = COLL_ALLREDUCE;
     else if (!strcmp(coll_str, "AllGather")) coll = COLL_ALLGATHER;
     else if (!strcmp(coll_str, "Reduce"))    coll = COLL_REDUCE;
     else {
         fprintf(stderr, "unknown collective: %s\n", coll_str);
+        MPI_Abort(MPI_COMM_WORLD, 1);
         return EXIT_FAILURE;
     }
+
+    const char *check_env = getenv(CHECK_ENV);
+    int do_check = (check_env &&
+                    (check_env[0] == '1' || strcmp(check_env, "on") == 0));
 
     int world_rank, world_size;
     MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
@@ -152,29 +253,17 @@ int main(int argc, char **argv) {
     int n_gpus;
     CUDA_CHECK(cudaGetDeviceCount(&n_gpus));
     if (world_rank >= n_gpus) {
-        fprintf(stderr,
-            "[rank %d] world_size %d > n_gpus %d — reduce -n\n",
-            world_rank, world_size, n_gpus);
+        fprintf(stderr, "[rank %d] world_size %d > n_gpus %d — reduce -n\n",
+                world_rank, world_size, n_gpus);
         MPI_Abort(MPI_COMM_WORLD, 1);
     }
     CUDA_CHECK(cudaSetDevice(world_rank));
 
     /* ── buffer sizing ────────────────────────────────────────────────── */
 
-    /*
-     * send buffer: always `count` floats.
-     * recv buffer:
-     *   allgather → count * world_size floats (each rank contributes count)
-     *   all others → count floats
-     *
-     * reduce: only rank 0 needs a meaningful recv buffer, but we allocate
-     * it on every rank to keep the code uniform; NCCL ignores the pointer
-     * on non-root ranks for ncclReduce.
-     */
     const size_t send_count = count;
     const size_t recv_count = (coll == COLL_ALLGATHER)
-                              ? count * (size_t)world_size
-                              : count;
+                              ? count * (size_t)world_size : count;
     const size_t send_bytes = send_count * sizeof(float);
     const size_t recv_bytes = recv_count * sizeof(float);
 
@@ -182,8 +271,7 @@ int main(int argc, char **argv) {
     CUDA_CHECK(cudaMalloc(&d_send, send_bytes));
     CUDA_CHECK(cudaMalloc(&d_recv, recv_bytes));
 
-    /* fill send buffer with 1.0f — ncclSum gives predictable integer results */
-    fill_device(d_send, send_count, 1.0f);
+    fill_device_ranked(d_send, send_count, world_rank);
 
     /* ── stream and events ────────────────────────────────────────────── */
 
@@ -195,11 +283,6 @@ int main(int argc, char **argv) {
 
     /* ── NCCL communicator ────────────────────────────────────────────── */
 
-    /*
-     * Standard pattern: rank 0 generates a unique ID, broadcasts it via MPI,
-     * every rank calls ncclCommInitRank with the same ID.
-     * NCCL_ALGO is already set in the environment by the caller.
-     */
     ncclUniqueId nccl_id;
     if (world_rank == 0) NCCL_CHECK(ncclGetUniqueId(&nccl_id));
     MPI_Bcast(&nccl_id, sizeof(nccl_id), MPI_BYTE, 0, MPI_COMM_WORLD);
@@ -214,17 +297,15 @@ int main(int argc, char **argv) {
     for (int iter = 0; iter < WARMUP; iter++) {
         run_coll(coll, send_count, comm, stream, d_send, d_recv, world_rank);
         CUDA_CHECK(cudaStreamSynchronize(stream));
+
+        if (iter == 0 && do_check)
+            check_correctness(coll, count, d_recv, world_rank, world_size);
     }
 
     MPI_Barrier(MPI_COMM_WORLD);
 
     /* ── measurement ──────────────────────────────────────────────────── */
 
-    /*
-     * MPI_Barrier before each iteration ensures all ranks start the
-     * collective at the same wall-clock moment, so the event-measured
-     * time includes any real load-imbalance straggler effect.
-     */
     float iter_ms[ITERS];
 
     for (int iter = 0; iter < ITERS; iter++) {
@@ -236,6 +317,9 @@ int main(int argc, char **argv) {
         float ms = 0.f;
         CUDA_CHECK(cudaEventElapsedTime(&ms, ev0, ev1));
         iter_ms[iter] = ms;
+
+        if (WARMUP == 0 && iter == 0 && do_check)
+            check_correctness(coll, count, d_recv, world_rank, world_size);
     }
 
     /* ── per-rank stats ───────────────────────────────────────────────── */
@@ -251,11 +335,6 @@ int main(int argc, char **argv) {
 
     /* ── global reduction ─────────────────────────────────────────────── */
 
-    /*
-     * Gather all per-rank medians to rank 0, compute median-of-medians.
-     * True straggler = max single-rank max across all ranks.
-     * True best      = min single-rank min across all ranks.
-     */
     float *all_medians = NULL;
     if (world_rank == 0)
         all_medians = (float *)malloc(world_size * sizeof(float));
@@ -269,17 +348,34 @@ int main(int argc, char **argv) {
 
     /* ── report (rank 0 only) ─────────────────────────────────────────── */
 
+    /*
+     * STATUS_OK=0 < STATUS_ERROR_ASSERT=1 < STATUS_ERROR_RUNTIME=2, so
+     * MPI_MAX across all ranks gives the worst status seen anywhere.
+     * Rank 0 prints a single line; no per-rank noise.
+     */
+    int local_status  = (int)g_status;
+    int global_status = STATUS_OK;
+    MPI_Reduce(&local_status, &global_status, 1, MPI_INT, MPI_MAX, 0, MPI_COMM_WORLD);
+
     if (world_rank == 0) {
-        /* median-of-medians over all ranks */
+        const char *status_str;
+        switch (global_status) {
+            case STATUS_OK:            status_str = "success";         break;
+            case STATUS_ERROR_ASSERT:  status_str = "error assert";    break;
+            case STATUS_ERROR_RUNTIME: status_str = "error cuda/nccl"; break;
+            default:                   status_str = "unknown";          break;
+        }
+        printf("status:     %s\n", status_str);
+
         qsort(all_medians, world_size, sizeof(float), cmp_float);
         float global_median = (world_size & 1)
             ? all_medians[world_size / 2]
             : (all_medians[world_size/2 - 1] + all_medians[world_size/2]) * 0.5f;
         free(all_medians);
 
-        printf("collective: %s\n",           coll_str);
-        printf("vec_size:   %zu floats\n",   count);
-        printf("ranks:      %d\n",           world_size);
+        printf("collective: %s\n",            coll_str);
+        printf("vec_size:   %zu floats\n",    count);
+        printf("ranks:      %d\n",            world_size);
         printf("warmup:     %d  iters: %d\n", WARMUP, ITERS);
         printf("median:     %llu ns\n",
                (unsigned long long)(uint64_t)(global_median    * 1e6f));
@@ -299,5 +395,5 @@ int main(int argc, char **argv) {
     CUDA_CHECK(cudaEventDestroy(ev1));
 
     MPI_Finalize();
-    return EXIT_SUCCESS;
+    return (g_status == STATUS_OK) ? EXIT_SUCCESS : EXIT_FAILURE;
 }

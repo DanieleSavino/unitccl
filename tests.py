@@ -2,7 +2,7 @@
 import sys, os
 import fastest
 import unitccl
-from fastest.plotting import Plotter, PlotMode, LegendLocation, LineStyle, MarkerStyle
+from fastest.plotting import Plotter, PlotMode, PlotTransform, LegendLocation, LineStyle, MarkerStyle
 
 # ── configuration ────────────────────────────────────────────────────────────
 
@@ -10,7 +10,7 @@ COLLS = {
     "AllGather":     True,
     "AllGatherV":    True,
     "AllReduce":     True,
-    "Bcast":     True,
+    "Bcast":         True,
     "Reduce":        True,
     "ReduceScatter": True,
 }
@@ -60,7 +60,7 @@ PROTOS = {
 }
 
 ENV = {
-    "UNITCCL_CHECK_BINE": "0",  # set to "1" or "ON" to enable bine correctness checks
+    "UNITCCL_CHECK_BINE": "1",  # set to "1" or "ON" to enable bine correctness checks
     # "NCCL_DEBUG": "INFO",
 }
 
@@ -68,6 +68,10 @@ N_REPEATS   = 1
 PLOT_MODE   = PlotMode.MEDIAN
 PLOT_DIR    = "plots"
 PLOT_COLORS = ["#00d2ff", "#ff6b6b", "#a8ff78", "#f7971e", "#c471ed"]
+
+# X-axis tick labels matching DEFINE_TEST_1KB_64MB expansion order.
+# If you add more sizes in bench_test.h, extend this list to match.
+TICK_LABELS = Plotter.SIZES_1KB_64MB   # ["1kB", "16kB", "256kB", "4MB", "64MB"]
 
 # ── args ─────────────────────────────────────────────────────────────────────
 #
@@ -127,8 +131,9 @@ def make_plotter(coll: str, proto: str) -> Plotter:
     p = (
         Plotter()
         .set_title(f"{coll} scaling — {proto}")
-        .set_x_label("Input size")
-        .set_y_label("Execution time")
+        .set_x_label("Message size")
+        .set_y_label("Latency")           # unit appended automatically by formatter
+        .set_x_tick_labels(TICK_LABELS)   # "1kB", "16kB", "256kB", "4MB", "64MB"
         .set_bg_color("#1a1a2e")
         .set_title_color("#e0e0e0")
         .set_label_color("#cccccc")
@@ -142,6 +147,13 @@ def make_plotter(coll: str, proto: str) -> Plotter:
     )
     for i, c in enumerate(PLOT_COLORS):
         p.set_pool_color(i, c)
+    return p
+
+def make_diff_plotter(coll: str, proto: str, baseline_algo: str) -> Plotter:
+    """Like make_plotter but pre-titled for DIFF transform output."""
+    p = make_plotter(coll, proto)
+    p.set_title(f"{coll} scaling — {proto}  (Δ vs {baseline_algo})")
+    p.set_y_label(f"Δ vs {baseline_algo}")   # % suffix added by formatter
     return p
 
 # ── main ──────────────────────────────────────────────────────────────────────
@@ -177,6 +189,9 @@ if opts["scaling"]:
             for algo in coll_algos
         }
 
+        # First active algo is the diff baseline (pool 0 in compare()).
+        baseline_algo = coll_algos[0]
+
         for proto in active_protos:
             os.environ["NCCL_PROTO"] = proto
             print(color(f"\n  {coll}  proto={proto}  algos={coll_algos}", sep_color))
@@ -187,6 +202,13 @@ if opts["scaling"]:
             if opts["plot"]:
                 file_dir = f"{PLOT_DIR}/{coll}"
                 os.makedirs(file_dir, exist_ok=True)
+
                 file_path = f"{file_dir}/{coll}_{proto}.png"
                 make_plotter(coll, proto).plot(cmp, file_path, PLOT_MODE)
+                print(color(f"   saved → {file_path}", "dim"))
+
+                file_path = f"{file_dir}/{coll}_{proto}_diff.png"
+                make_diff_plotter(coll, proto, baseline_algo).plot(
+                    cmp, file_path, PLOT_MODE, PlotTransform.DIFF
+                )
                 print(color(f"   saved → {file_path}", "dim"))
