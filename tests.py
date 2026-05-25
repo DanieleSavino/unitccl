@@ -42,7 +42,7 @@ ALGOS = {
     },
     "Reduce": {
         "RING": True,
-        "BINE": False,
+        "BINE": True,
     },
     "ReduceScatter": {
         "RING":           True,

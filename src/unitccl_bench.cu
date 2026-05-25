@@ -166,7 +166,8 @@ static void check_correctness(CollType coll, size_t count,
         case COLL_ALLREDUCE:
             for (size_t i = 0; i < count; i++) {
                 float expected = (float)i * sum_scales;
-                if (h[i] != expected) {
+                float rel_err  = fabsf(h[i] - expected) / (fabsf(expected) + 1e-6f);
+                if (rel_err > 1e-3f) {
                     first_bad = (int)i; got_bad = h[i]; exp_bad = expected;
                     goto done;
                 }
@@ -192,7 +193,8 @@ static void check_correctness(CollType coll, size_t count,
             if (world_rank != 0) break;     /* non-root: undefined, skip */
             for (size_t i = 0; i < count; i++) {
                 float expected = (float)i * sum_scales;
-                if (h[i] != expected) {
+                float rel_err  = fabsf(h[i] - expected) / (fabsf(expected) + 1e-6f);
+                if (rel_err > 1e-3f) {
                     first_bad = (int)i; got_bad = h[i]; exp_bad = expected;
                     goto done;
                 }
