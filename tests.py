@@ -49,7 +49,7 @@ ALGOS = {
         "COLLNET_DIRECT": False,
         "NVLS":           False,
         "PAT":            False,
-        "BINE":           False,
+        "BINE":           True,
     },
 }
 

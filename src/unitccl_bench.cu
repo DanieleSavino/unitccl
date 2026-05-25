@@ -8,15 +8,17 @@
  * Correctness check (iteration 0 only):
  *   UNITCCL_CHECK_BINE=1 NCCL_ALGO=BINE mpirun -n 4 ./unitccl_bench AllReduce 1048576
  *
- * argv: <Bcast|AllReduce|AllGather|Reduce> <vec_size_floats>
+ * argv: <Bcast|AllReduce|AllGather|Reduce|ReduceScatter> <vec_size_floats>
  *
  * Notes:
  *   - rank i owns GPU i (cudaSetDevice(world_rank))
  *   - ncclCommInitRank via MPI_Bcast of unique ID
  *   - send buffer fill: send[i] = (rank+1) * i  for every rank and collective;
  *     using (rank+1) so rank 0 also sends non-zero data
- *   - allgather recv buffer is count*world_size elements — allocated correctly
- *     per rank since every rank participates symmetrically
+ *   - buffer sizing:
+ *       AllGather:     send = count,             recv = count * world_size
+ *       ReduceScatter: send = count * world_size, recv = count
+ *       all others:    send = count,             recv = count
  *   - timing: cudaEvent pair on the single stream, all ranks sync via
  *     MPI_Barrier before each iteration so we measure the collective cleanly
  *   - stats: each rank computes its own median/min/max; rank 0 gathers and
@@ -71,7 +73,13 @@ static Status g_status = STATUS_OK;
 
 /* ── types ──────────────────────────────────────────────────────────────── */
 
-typedef enum { COLL_BCAST, COLL_ALLREDUCE, COLL_ALLGATHER, COLL_REDUCE } CollType;
+typedef enum {
+    COLL_BCAST,
+    COLL_ALLREDUCE,
+    COLL_ALLGATHER,
+    COLL_REDUCE,
+    COLL_REDUCESCATTER,
+} CollType;
 
 /* ── helpers ────────────────────────────────────────────────────────────── */
 
@@ -96,27 +104,37 @@ static void fill_device_ranked(float *d, size_t count, int rank) {
 
 /* ── collective dispatch ────────────────────────────────────────────────── */
 
-static void run_coll(CollType coll, size_t send_count,
+static void run_coll(CollType coll, size_t count,
                      ncclComm_t comm, cudaStream_t stream,
                      float *d_send, float *d_recv,
                      int world_rank) {
     switch (coll) {
         case COLL_BCAST:
-            NCCL_CHECK(ncclBroadcast(d_send, d_recv, send_count,
+            NCCL_CHECK(ncclBroadcast(d_send, d_recv, count,
                                      ncclFloat, /*root=*/0, comm, stream));
             break;
         case COLL_ALLREDUCE:
-            NCCL_CHECK(ncclAllReduce(d_send, d_recv, send_count,
+            NCCL_CHECK(ncclAllReduce(d_send, d_recv, count,
                                      ncclFloat, ncclSum, comm, stream));
             break;
         case COLL_ALLGATHER:
-            NCCL_CHECK(ncclAllGather(d_send, d_recv, send_count,
+            NCCL_CHECK(ncclAllGather(d_send, d_recv, count,
                                      ncclFloat, comm, stream));
             break;
         case COLL_REDUCE:
-            NCCL_CHECK(ncclReduce(d_send, d_recv, send_count,
+            NCCL_CHECK(ncclReduce(d_send, d_recv, count,
                                   ncclFloat, ncclSum, /*root=*/0,
                                   comm, stream));
+            break;
+        case COLL_REDUCESCATTER:
+            /*
+             * ncclReduceScatter's third argument is recvcount — the number of
+             * elements each rank receives (== count).  d_send holds
+             * count * world_size elements; NCCL derives the total from
+             * recvcount * comm_size internally.
+             */
+            NCCL_CHECK(ncclReduceScatter(d_send, d_recv, count,
+                                         ncclFloat, ncclSum, comm, stream));
             break;
     }
 }
@@ -128,10 +146,12 @@ static void run_coll(CollType coll, size_t send_count,
  *
  * All collectives use send[i] = (rank+1)*i, so expected recv values are:
  *
- *   Bcast:     recv[i] == (0+1)*i == i
- *   AllReduce: recv[i] == i * W*(W+1)/2
- *   AllGather: recv[r*count + i] == (r+1)*i
- *   Reduce:    recv[i] == i * W*(W+1)/2  (root rank 0 only)
+ *   Bcast:         recv[i]           == i                      (root=0, scale=1)
+ *   AllReduce:     recv[i]           == i * W*(W+1)/2
+ *   AllGather:     recv[r*count + i] == (r+1)*i
+ *   Reduce:        recv[i]           == i * W*(W+1)/2          (root rank 0 only)
+ *   ReduceScatter: recv[i]           == (rank*count + i) * W*(W+1)/2
+ *                  (rank r holds chunk r of the full AllReduce result)
  */
 static void check_correctness(CollType coll, size_t count,
                                float *d_recv, int world_rank, int world_size) {
@@ -200,6 +220,25 @@ static void check_correctness(CollType coll, size_t count,
                 }
             }
             break;
+
+        case COLL_REDUCESCATTER:
+            /*
+             * Rank r owns chunk r of the full AllReduce result.
+             * Global index of recv[i] is (world_rank * count + i), so:
+             *   expected = (world_rank * count + i) * sum_scales
+             *
+             * When world_rank == 0 and i == 0 the expected value is 0;
+             * the relative-error formula handles this via the +1e-6 epsilon.
+             */
+            for (size_t i = 0; i < count; i++) {
+                float expected = (float)((size_t)world_rank * count + i) * sum_scales;
+                float rel_err  = fabsf(h[i] - expected) / (fabsf(expected) + 1e-6f);
+                if (rel_err > 1e-3f) {
+                    first_bad = (int)i; got_bad = h[i]; exp_bad = expected;
+                    goto done;
+                }
+            }
+            break;
     }
 
 done:
@@ -221,7 +260,7 @@ int main(int argc, char **argv) {
     if (argc != 3) {
         fprintf(stderr,
             "usage: NCCL_ALGO=<ALGO> mpirun -n <ngpus> %s"
-            " <Bcast|AllReduce|AllGather|Reduce> <vec_size_floats>\n",
+            " <Bcast|AllReduce|AllGather|Reduce|ReduceScatter> <vec_size_floats>\n",
             argv[0]);
         MPI_Abort(MPI_COMM_WORLD, 1);
         return EXIT_FAILURE;
@@ -231,11 +270,12 @@ int main(int argc, char **argv) {
     size_t      count    = (size_t)atoll(argv[2]);
 
     CollType coll;
-    if      (!strcmp(coll_str, "Bcast"))     { coll = COLL_BCAST;
-                                               setenv("NCCL_ALLGATHERV_ENABLE", "0", 1); }
-    else if (!strcmp(coll_str, "AllReduce")) coll = COLL_ALLREDUCE;
-    else if (!strcmp(coll_str, "AllGather")) coll = COLL_ALLGATHER;
-    else if (!strcmp(coll_str, "Reduce"))    coll = COLL_REDUCE;
+    if      (!strcmp(coll_str, "Bcast"))        { coll = COLL_BCAST;
+                                                   setenv("NCCL_ALLGATHERV_ENABLE", "0", 1); }
+    else if (!strcmp(coll_str, "AllReduce"))      coll = COLL_ALLREDUCE;
+    else if (!strcmp(coll_str, "AllGather"))      coll = COLL_ALLGATHER;
+    else if (!strcmp(coll_str, "Reduce"))         coll = COLL_REDUCE;
+    else if (!strcmp(coll_str, "ReduceScatter"))  coll = COLL_REDUCESCATTER;
     else {
         fprintf(stderr, "unknown collective: %s\n", coll_str);
         MPI_Abort(MPI_COMM_WORLD, 1);
@@ -263,7 +303,13 @@ int main(int argc, char **argv) {
 
     /* ── buffer sizing ────────────────────────────────────────────────── */
 
-    const size_t send_count = count;
+    /*
+     * ReduceScatter is the dual of AllGather:
+     *   AllGather:     send = count,             recv = count * world_size
+     *   ReduceScatter: send = count * world_size, recv = count
+     */
+    const size_t send_count = (coll == COLL_REDUCESCATTER)
+                              ? count * (size_t)world_size : count;
     const size_t recv_count = (coll == COLL_ALLGATHER)
                               ? count * (size_t)world_size : count;
     const size_t send_bytes = send_count * sizeof(float);
@@ -297,7 +343,7 @@ int main(int argc, char **argv) {
     /* ── warmup ───────────────────────────────────────────────────────── */
 
     for (int iter = 0; iter < WARMUP; iter++) {
-        run_coll(coll, send_count, comm, stream, d_send, d_recv, world_rank);
+        run_coll(coll, count, comm, stream, d_send, d_recv, world_rank);
         CUDA_CHECK(cudaStreamSynchronize(stream));
 
         if (iter == 0 && do_check)
@@ -313,7 +359,7 @@ int main(int argc, char **argv) {
     for (int iter = 0; iter < ITERS; iter++) {
         MPI_Barrier(MPI_COMM_WORLD);
         CUDA_CHECK(cudaEventRecord(ev0, stream));
-        run_coll(coll, send_count, comm, stream, d_send, d_recv, world_rank);
+        run_coll(coll, count, comm, stream, d_send, d_recv, world_rank);
         CUDA_CHECK(cudaEventRecord(ev1, stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
         float ms = 0.f;
