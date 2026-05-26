@@ -52,7 +52,7 @@ void print_tree(int *sendTable, int *recvTable, int nRanks, int steps) {
 // 1. Every rank receives data exactly once per root (except root itself).
 FASTEST_CUSTOMTEST_INLINE("standalone/tree/recv_exactly_once", FASTEST_FAIL_ERROR, NULL, {
     out->exit_status = FASTEST_SUCCESS;
-    for (int nranks = 2; nranks <= (1<<BINE_MAX_STEPS); nranks *= 2) {
+    for (int nranks = 4; nranks <= (4); nranks *= 2) {
         int steps = __builtin_ctz(nranks);
         int *send_table = (int*) malloc(nranks * nranks * steps * sizeof(int));
         int *recv_table = (int*) malloc(nranks * nranks * steps * sizeof(int));

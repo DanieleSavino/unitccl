@@ -25,24 +25,35 @@ static int run_bench(const char *coll, const char *algo, size_t nbytes,
         out->exit_status = FASTEST_ERROR_RESOURCE;
         return -1;
     }
+
     char     line[256];
-    int      got_median = 0;
-    uint64_t median_ns = 0;
+    int      got_median   = 0;
+    int      got_status   = 0;
+    uint64_t median_ns    = 0;
+    int      bench_status = FASTEST_SUCCESS;
     while (fgets(line, sizeof(line), fp)) {
         fprintf(stderr, "[bench] %s", line);
         if (strncmp(line, "median:", 7) == 0) {
             got_median = 1;
             sscanf(line, "median: %llu ns", (unsigned long long *)&median_ns);
+        } else if (strncmp(line, "status:", 7) == 0) {
+            got_status = 1;
+            if      (strstr(line, "error assert"))    bench_status = FASTEST_ERROR_ASSERT;
+            else if (strstr(line, "error cuda/nccl")) bench_status = FASTEST_ERROR_RESOURCE;
+            /* "success" → bench_status stays FASTEST_SUCCESS */
         }
     }
-done:
     int ret = pclose(fp);
     if (ret != 0) {
         out->exit_status |= FASTEST_ERROR_RESOURCE;
         return -1;
     }
-    if (!got_median) {
+    if (!got_median || !got_status) {
         out->exit_status |= FASTEST_ERROR_UNEXPECTED;
+        return -1;
+    }
+    if (bench_status != FASTEST_SUCCESS) {
+        out->exit_status = bench_status;
         return -1;
     }
     out->time_ns     = median_ns;
