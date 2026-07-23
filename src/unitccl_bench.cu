@@ -416,10 +416,10 @@ int main(int argc, char **argv) {
         }
         printf("status:     %s\n", status_str);
 
-        qsort(iter_stragglers_ms, world_size, sizeof(float), cmp_float);
-        float global_median = (world_size & 1)
-            ? iter_stragglers_ms[world_size / 2]
-            : (iter_stragglers_ms[world_size/2 - 1] + iter_stragglers_ms[world_size/2]) * 0.5f;
+        qsort(iter_stragglers_ms, iters, sizeof(float), cmp_float);
+        float global_median = (iters & 1)
+            ? iter_stragglers_ms[iters / 2]
+            : (iter_stragglers_ms[iters/2 - 1] + iter_stragglers_ms[iters/2]) * 0.5f;
 
         printf("collective: %s\n",            coll_str);
         printf("vec_size:   %zu floats\n",    count);

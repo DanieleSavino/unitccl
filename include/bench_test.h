@@ -45,8 +45,9 @@ static int run_bench(const char *coll, const char *algo, size_t nbytes,
     }
     int ret = pclose(fp);
     if (ret != 0) {
+        fprintf(stderr, "[bench] pclose failed: %d\n", ret);
         out->exit_status |= FASTEST_ERROR_RESOURCE;
-        return -1;
+        //return -1;
     }
     if (!got_median || !got_status) {
         out->exit_status |= FASTEST_ERROR_UNEXPECTED;

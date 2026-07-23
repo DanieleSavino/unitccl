@@ -3,11 +3,11 @@
 #SBATCH --partition=gpu
 #SBATCH --qos=default
 #SBATCH --nodes=2
-#SBATCH --ntasks=2
-#SBATCH --gres=gpu:1
+#SBATCH --ntasks=8
+#SBATCH --gres=gpu:4
 #SBATCH --cpus-per-task=8
 #SBATCH --gpus-per-task=1
-#SBATCH --time=00:00:30
+#SBATCH --time=00:03:00
 #SBATCH -o logs/run.out
 #SBATCH -e logs/run.err
 
@@ -30,11 +30,13 @@ source .venv/bin/activate
 
 #NCCL_ALGO=RING mpirun -n 8 ./build/unitccl_bench ReduceScatter 16
 #NCCL_PROTO=SIMPLE NCCL_ALGO=RING mpirun -n 2 ./build/unitccl_bench Bcast 16
-NCCL_PROTO=SIMPLE NCCL_ALGO=BINE mpirun -n 2 ./build/unitccl_bench AllGather 16
+#NCCL_PROTO=SIMPLE NCCL_ALGO=BINE mpirun -n 2 ./build/unitccl_bench AllGather 16
 #NCCL_PROTO=SIMPLE NCCL_ALGO=BINE mpirun -n 2 ./build/unitccl_bench Bcast 16
 
 #NCCL_MIN_NCHANNELS=1 NCCL_MAX_NCHANNELS=1 NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=INIT NCCL_ALGO=BINE NCCL_PROTO=SIMPLE mpirun -n 2 ./build/unitccl_bench AllGather 64
 
 #./scripts/run_tests.sh standalone
 
-#./scripts/run_tests.sh scaling plot csv coll=Reduce proto=LL
+#NCCL_PROTO=SIMPLE NCCL_ALGO=BINE mpirun -n 8 ./build/unitccl_bench Bcast 16
+
+./scripts/run_tests.sh scaling plot csv coll=Reduce proto=SIMPLE

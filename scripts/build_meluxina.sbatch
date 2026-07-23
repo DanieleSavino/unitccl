@@ -42,4 +42,4 @@ cd $SLURM_SUBMIT_DIR
 make clean
 make -j NVCC_GENCODE="-gencode arch=compute_80,code=sm_80"
 
-#./scripts/build_wheel.sh
+./scripts/build_wheel.sh

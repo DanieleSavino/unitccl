@@ -1,0 +1,14 @@
+# Core
+pandas>=1.5
+matplotlib>=3.6
+
+# Slurm sweep support (unitccl scaling ... ranks=4,8,16,...)
+submitit>=1.5
+
+# NOT on PyPI -- install these into the same venv separately, they are
+# project-specific and not part of this package:
+#
+#   fastest_py       -- from vendor/fastest/fastest_py (pip install -e .)
+#   <backend module> -- the compiled pybind11 extension built by your
+#                        project's build_wheel.sh (e.g. `unitccl`, `showcase`,
+#                        or whatever project you point `backend_module` at)
