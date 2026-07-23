@@ -37,10 +37,12 @@
 #include <cuda_runtime.h>
 #include <nccl.h>
 
-#define WARMUP  10
-#define ITERS   50
+#define CHECK_ENV "UNITCCL_CHECK"
+#define ITERS_ENV "UNITCCL_ITERS"
+#define WARMUP_ENV "UNITCCL_WARMUP"
 
-#define CHECK_ENV "UNITCCL_CHECK_BINE"
+#define DEFAULT_WARMUP 10
+#define DEFAULT_ITERS  40
 
 /* ── status tracking ────────────────────────────────────────────────────── */
 
@@ -259,9 +261,10 @@ int main(int argc, char **argv) {
 
     if (argc != 3) {
         fprintf(stderr,
-            "usage: NCCL_ALGO=<ALGO> mpirun -n <ngpus> %s"
+            "usage: %s=<check> %s=<iters> %s=<warmup> NCCL_ALGO=<ALGO> mpirun -n <ngpus> %s"
             " <Bcast|AllReduce|AllGather|Reduce|ReduceScatter> <vec_size_floats>\n",
-            argv[0]);
+            CHECK_ENV, ITERS_ENV, WARMUP_ENV, argv[0]
+        );
         MPI_Abort(MPI_COMM_WORLD, 1);
         return EXIT_FAILURE;
     }
@@ -286,20 +289,35 @@ int main(int argc, char **argv) {
     int do_check = (check_env &&
                     (check_env[0] == '1' || strcmp(check_env, "on") == 0));
 
+    const char *warmup_env = getenv(WARMUP_ENV);
+    int warmup = (warmup_env && (atoi(warmup_env) > 0)) ? atoi(warmup_env) : DEFAULT_WARMUP;
+
+    const char *iters_env = getenv(ITERS_ENV);
+    int iters = (iters_env && (atoi(iters_env) > 0)) ? atoi(iters_env) : DEFAULT_ITERS;
+
     int world_rank, world_size;
     MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
     MPI_Comm_size(MPI_COMM_WORLD, &world_size);
 
     /* ── GPU assignment ───────────────────────────────────────────────── */
 
+    MPI_Comm local_comm;
+    MPI_Comm_split_type(MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED, world_rank,
+                        MPI_INFO_NULL, &local_comm);
+
+    int local_rank;
+    MPI_Comm_rank(local_comm, &local_rank);
+
     int n_gpus;
     CUDA_CHECK(cudaGetDeviceCount(&n_gpus));
-    if (world_rank >= n_gpus) {
-        fprintf(stderr, "[rank %d] world_size %d > n_gpus %d — reduce -n\n",
-                world_rank, world_size, n_gpus);
+    if (local_rank >= n_gpus) {
+        fprintf(stderr, "[rank %d] local_rank %d >= n_gpus %d on this node\n",
+                world_rank, local_rank, n_gpus);
         MPI_Abort(MPI_COMM_WORLD, 1);
     }
-    CUDA_CHECK(cudaSetDevice(world_rank));
+    CUDA_CHECK(cudaSetDevice(local_rank));
+
+    MPI_Comm_free(&local_comm);
 
     /* ── buffer sizing ────────────────────────────────────────────────── */
 
@@ -342,7 +360,7 @@ int main(int argc, char **argv) {
 
     /* ── warmup ───────────────────────────────────────────────────────── */
 
-    for (int iter = 0; iter < WARMUP; iter++) {
+    for (int iter = 0; iter < warmup; iter++) {
         run_coll(coll, count, comm, stream, d_send, d_recv, world_rank);
         CUDA_CHECK(cudaStreamSynchronize(stream));
 
@@ -354,9 +372,10 @@ int main(int argc, char **argv) {
 
     /* ── measurement ──────────────────────────────────────────────────── */
 
-    float iter_ms[ITERS];
+    float iter_ms[iters];
+    float iter_stragglers_ms[iters];
 
-    for (int iter = 0; iter < ITERS; iter++) {
+    for (int iter = 0; iter < iters; iter++) {
         MPI_Barrier(MPI_COMM_WORLD);
         CUDA_CHECK(cudaEventRecord(ev0, stream));
         run_coll(coll, count, comm, stream, d_send, d_recv, world_rank);
@@ -366,33 +385,15 @@ int main(int argc, char **argv) {
         CUDA_CHECK(cudaEventElapsedTime(&ms, ev0, ev1));
         iter_ms[iter] = ms;
 
-        if (WARMUP == 0 && iter == 0 && do_check)
+        if (warmup == 0 && iter == 0 && do_check)
             check_correctness(coll, count, d_recv, world_rank, world_size);
+
+        if(world_rank == 0) {
+            MPI_Reduce(&iter_ms[iter], &iter_stragglers_ms[iter], 1, MPI_FLOAT, MPI_MAX, 0, MPI_COMM_WORLD);
+        } else {
+            MPI_Reduce(&iter_ms[iter], NULL, 1, MPI_FLOAT, MPI_MAX, 0, MPI_COMM_WORLD);
+        }
     }
-
-    /* ── per-rank stats ───────────────────────────────────────────────── */
-
-    float sorted[ITERS];
-    memcpy(sorted, iter_ms, sizeof(sorted));
-    qsort(sorted, ITERS, sizeof(float), cmp_float);
-
-    float rank_min    = sorted[0];
-    float rank_max    = sorted[ITERS - 1];
-    float rank_median = (ITERS & 1) ? sorted[ITERS / 2]
-                        : (sorted[ITERS/2 - 1] + sorted[ITERS/2]) * 0.5f;
-
-    /* ── global reduction ─────────────────────────────────────────────── */
-
-    float *all_medians = NULL;
-    if (world_rank == 0)
-        all_medians = (float *)malloc(world_size * sizeof(float));
-
-    MPI_Gather(&rank_median, 1, MPI_FLOAT,
-               all_medians, 1, MPI_FLOAT, 0, MPI_COMM_WORLD);
-
-    float global_min, global_straggler;
-    MPI_Reduce(&rank_min, &global_min,       1, MPI_FLOAT, MPI_MIN, 0, MPI_COMM_WORLD);
-    MPI_Reduce(&rank_max, &global_straggler, 1, MPI_FLOAT, MPI_MAX, 0, MPI_COMM_WORLD);
 
     /* ── report (rank 0 only) ─────────────────────────────────────────── */
 
@@ -415,27 +416,26 @@ int main(int argc, char **argv) {
         }
         printf("status:     %s\n", status_str);
 
-        qsort(all_medians, world_size, sizeof(float), cmp_float);
+        qsort(iter_stragglers_ms, world_size, sizeof(float), cmp_float);
         float global_median = (world_size & 1)
-            ? all_medians[world_size / 2]
-            : (all_medians[world_size/2 - 1] + all_medians[world_size/2]) * 0.5f;
-        free(all_medians);
+            ? iter_stragglers_ms[world_size / 2]
+            : (iter_stragglers_ms[world_size/2 - 1] + iter_stragglers_ms[world_size/2]) * 0.5f;
 
         printf("collective: %s\n",            coll_str);
         printf("vec_size:   %zu floats\n",    count);
         printf("ranks:      %d\n",            world_size);
-        printf("warmup:     %d  iters: %d\n", WARMUP, ITERS);
+        printf("warmup:     %d  iters: %d\n", warmup, iters);
         printf("median:     %llu ns\n",
                (unsigned long long)(uint64_t)(global_median    * 1e6f));
         printf("min:        %llu ns\n",
-               (unsigned long long)(uint64_t)(global_min       * 1e6f));
+               (unsigned long long)(uint64_t)(iter_stragglers_ms[0]       * 1e6f));
         printf("straggler:  %llu ns\n",
-               (unsigned long long)(uint64_t)(global_straggler * 1e6f));
+               (unsigned long long)(uint64_t)(iter_stragglers_ms[iters - 1] * 1e6f));
     }
 
     /* ── cleanup ──────────────────────────────────────────────────────── */
 
-    NCCL_CHECK(ncclCommDestroy(comm));
+    // NCCL_CHECK(ncclCommDestroy(comm));
     CUDA_CHECK(cudaFree(d_send));
     CUDA_CHECK(cudaFree(d_recv));
     CUDA_CHECK(cudaStreamDestroy(stream));

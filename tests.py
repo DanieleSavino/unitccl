@@ -60,7 +60,9 @@ PROTOS = {
 }
 
 ENV = {
-    "UNITCCL_CHECK_BINE": "1",  # set to "1" or "ON" to enable bine correctness checks
+    "UNITCCL_CHECK": "1",  # set to "1" or "ON" to enable bine correctness checks
+    "UNITCCL_ITERS":   "40",
+    "UNITCCL_WARMUP":  "10",
     # "NCCL_DEBUG": "INFO",
 }
 
@@ -90,7 +92,7 @@ TICK_LABELS = Plotter.SIZES_1KB_64MB   # ["1kB", "16kB", "256kB", "4MB", "64MB"]
 
 def parse_args(argv):
     flags   = set()
-    filters = {"coll": None, "algo": None, "proto": None}
+    filters = {"coll": None, "algo": None, "proto": None, "csv": None}
     env_overrides = {}
 
     for arg in argv:
@@ -113,6 +115,7 @@ def parse_args(argv):
         "standalone":    run_all or "standalone" in flags,
         "scaling":       run_all or "scaling"    in flags,
         "plot":          run_all or "plot"       in flags,
+        "csv":           run_all or "csv"        in flags,
         "coll_filter":   filters["coll"],
         "algo_filter":   filters["algo"],
         "proto_filter":  filters["proto"],
@@ -198,6 +201,12 @@ if opts["scaling"]:
 
             cmp = fastest.compare(*pools.values(), n_repeats=N_REPEATS)
             cmp.report()
+
+            if opts["csv"]:
+                file_dir = f"{PLOT_DIR}/{coll}"
+                os.makedirs(file_dir, exist_ok=True)
+                file_path = f"{file_dir}/{coll}_{proto}.csv"
+                cmp.save_csv(file_path)
 
             if opts["plot"]:
                 file_dir = f"{PLOT_DIR}/{coll}"
