@@ -126,28 +126,53 @@ def submit_standalone(timeout_min: int = 30, log_dir: str = "logs/standalone") -
     return [job]
 
 
-def wait_for(jobs: List) -> None:
-    """Blocks until every job finishes, prints each job's stdout/stderr,
-    then raises if any job failed."""
+def wait_for(jobs: List, poll_interval: float = 2.0) -> None:
+    import time
+    from pathlib import Path
+    """Streams each job's stdout/stderr live as it's written, then blocks
+    until all jobs finish and raises if any failed."""
+
+    # track how much of each file we've already printed
+    offsets = {job.job_id: {"stdout": 0, "stderr": 0} for job in jobs}
+    last_state = {job.job_id: None for job in jobs}
+
+    def _drain(job, stream: str) -> None:
+        path = Path(job.paths.stdout if stream == "stdout" else job.paths.stderr)
+        if not path.exists():
+            return
+        with open(path, "r") as f:
+            f.seek(offsets[job.job_id][stream])
+            chunk = f.read()
+            offsets[job.job_id][stream] = f.tell()
+        if chunk:
+            prefix = f"[{job.job_id}:{stream}] "
+            for line in chunk.splitlines():
+                print(prefix + line)
+
+    while not all(job.done() for job in jobs):
+        for job in jobs:
+            state = job.state
+            if state != last_state[job.job_id]:
+                info(f"job {job.job_id} → {state}")
+                last_state[job.job_id] = state
+            _drain(job, "stdout")
+            _drain(job, "stderr")
+        time.sleep(poll_interval)
+
+    # final drain, in case anything landed between the last poll and completion
+    for job in jobs:
+        state = job.state
+        if state != last_state[job.job_id]:
+            info(f"job {job.job_id} → {state}")
+        _drain(job, "stdout")
+        _drain(job, "stderr")
+
     failures = []
     for job in jobs:
         try:
-            result = job.result()
-        except Exception as e:  # job raised inside the Slurm process
+            job.results()
+        except Exception as e:
             failures.append((job, e))
-            result = None
-
-        stdout = job.stdout() or ""
-        stderr = job.stderr() or ""
-        info(f"--- job {job.job_id} stdout ---")
-        if stdout.strip():
-            print(stdout)
-        if stderr.strip():
-            info(f"--- job {job.job_id} stderr ---")
-            print(stderr)
-        if result is not None:
-            info(f"--- job {job.job_id} return value ---")
-            print(result)
 
     if failures:
         job, e = failures[0]

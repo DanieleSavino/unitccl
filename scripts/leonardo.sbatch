@@ -15,4 +15,4 @@ module load openmpi/4.1.6--gcc--12.2.0-cuda-12.2
 
 cd $SLURM_SUBMIT_DIR
 
-./scripts/run_tests.sh scaling plot coll=ReduceScatter
+./scripts/run_tests.sh scaling plot coll=Bcast proto=SIMPLE
