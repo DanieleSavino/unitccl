@@ -7,6 +7,7 @@ compile_commands.json
 __pycache__/
 *.pyc
 *.egg-info/
+pyrightconfig.json
 
 # pybind extension (built locally)
 vendor/fastest/bindings/*.so

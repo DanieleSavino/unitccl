@@ -1,9 +1,0 @@
-{
-  "stubPath": "stubs",
-  "extraPaths": [
-    "vendor/fastest/fastest_py/src",
-    "vendor/fastest/bindings"
-  ],
-  "venvPath": "/home/daniele/.conda/envs",
-  "venv": "unitccl"
-}

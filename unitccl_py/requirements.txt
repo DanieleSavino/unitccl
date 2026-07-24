@@ -1,10 +1,10 @@
 # Core
 pandas>=1.5
 matplotlib>=3.6
-
 # Slurm sweep support (unitccl scaling ... ranks=4,8,16,...)
 submitit>=1.5
-
+# Live job dashboard (slurm_utils.wait_for / tui_utils.watch_jobs)
+rich>=13.0
 # NOT on PyPI -- install these into the same venv separately, they are
 # project-specific and not part of this package:
 #

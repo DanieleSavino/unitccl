@@ -165,13 +165,28 @@ def submit_standalone(timeout_min: int = 30, log_dir: str = "logs/standalone") -
     return [job]
 
 
-def wait_for(jobs: List, poll_interval: float = 2.0) -> None:
-    import time
-    from pathlib import Path
-    """Streams each job's stdout/stderr live as it's written, then blocks
-    until all jobs finish and raises if any failed."""
+def wait_for(jobs: List, poll_interval: float = 2.0, tui: bool = True) -> None:
+    """Block until all jobs finish, raising if any failed.
 
-    # track how much of each file we've already printed
+    By default renders a live dashboard (job table + scrolling log tail)
+    via `tui_utils.watch_jobs`. Pass `tui=False` for the old plain
+    `[job_id:stream] line`-per-line printing (e.g. when piping to a file
+    or running in a non-interactive CI shell).
+
+    Either way, a job that ends up CANCELLED (via the TUI's cancel keys,
+    an external `scancel`, ctrl-C, etc.) is treated as a clean stop rather
+    than a hard failure -- only a genuine FAILED/TIMEOUT/exception raises.
+    """
+    if tui:
+        from .tui_utils import watch_jobs
+
+        watch_jobs(jobs, poll_interval=poll_interval)
+        return
+
+    from .tui_utils import raise_on_failure
+    from pathlib import Path
+    import time
+
     offsets = {job.job_id: {"stdout": 0, "stderr": 0} for job in jobs}
     last_state = {job.job_id: None for job in jobs}
 
@@ -198,7 +213,6 @@ def wait_for(jobs: List, poll_interval: float = 2.0) -> None:
             _drain(job, "stderr")
         time.sleep(poll_interval)
 
-    # final drain, in case anything landed between the last poll and completion
     for job in jobs:
         state = job.state
         if state != last_state[job.job_id]:
@@ -206,15 +220,5 @@ def wait_for(jobs: List, poll_interval: float = 2.0) -> None:
         _drain(job, "stdout")
         _drain(job, "stderr")
 
-    failures = []
-    for job in jobs:
-        try:
-            job.results()
-        except Exception as e:
-            failures.append((job, e))
-
-    if failures:
-        job, e = failures[0]
-        raise RuntimeError(f"job {job.job_id} failed: {e}") from e
-
+    raise_on_failure(jobs)
     ok("all sweep jobs finished")
