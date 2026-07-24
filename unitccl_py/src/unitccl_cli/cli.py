@@ -1,6 +1,6 @@
 """unitccl command-line entrypoint.
 
-    unitccl standalone
+    unitccl standalone <preload> <submit>
     unitccl scaling coll=Bcast,AllReduce algo=BINE,RING proto=SIMPLE plot csv check warmup=10 iters=40
     unitccl scaling coll=Bcast proto=SIMPLE csv ranks=4,8,16,32,64,128     # submitit sweep, one alloc/rank-count
     unitccl nsys [outdir] coll=Bcast,Reduce algo=BINE,RING proto=SIMPLE size=16777216 nranks=8 warmup=10 iters=40 check
@@ -9,6 +9,7 @@
     unitccl set account <value>
     unitccl set partition <value>
     unitccl set qos <value>
+    unitccl set nccl_lib </path/to/nccl/lib>
     unitccl preload add <module> [<module> ...]   # module load before every Slurm job
     unitccl preload rm  <module> [<module> ...]
 """
@@ -54,6 +55,30 @@ def _int_or_none(kv: dict, key: str) -> Optional[int]:
 
 
 # ── subcommands ──────────────────────────────────────────────────────────────
+
+
+def cmd_build(args) -> None:
+    from . import build_utils
+
+    tokens = set(args.rest)
+    clean = "clean" in tokens
+    submit = "submit" in tokens
+    preload = "preload" in tokens
+
+    if submit:
+        from . import slurm_utils
+
+        jobs = slurm_utils.submit_build(args.target, clean)
+        slurm_utils.wait_for(jobs)
+        return
+
+    if preload:
+        from . import slurm_utils
+
+        cfg = config.load()
+        slurm_utils.apply_preload_modules(cfg.get("preload_modules") or [])
+
+    build_utils.run_build(args.target, clean)
 
 
 def cmd_standalone(args) -> None:
@@ -155,7 +180,7 @@ def cmd_plot(args) -> None:
 
 
 def cmd_set(args) -> None:
-    key_map = {"account": "slurm_account", "partition": "slurm_partition", "qos": "slurm_qos"}
+    key_map = {"account": "slurm_account", "partition": "slurm_partition", "qos": "slurm_qos", "nccl_lib": "nccl_lib"}
     cfg_key = key_map[args.what]
     config.set_value(cfg_key, args.value)
     ok(f"{args.what} set to '{args.value}' ({config.CONFIG_FILE})")
@@ -169,6 +194,15 @@ def build_parser() -> argparse.ArgumentParser:
         prog="unitccl", description="Run, profile, and plot Bine-tree NCCL collective benchmarks."
     )
     sub = p.add_subparsers(dest="command", required=True)
+
+    sp = sub.add_parser("build", help="Build nccl / fastest / unitccl components.")
+    sp.add_argument("target", choices=["nccl", "fastest", "unitccl", "all"], help="Component to build.")
+    sp.add_argument(
+        "rest",
+        nargs=argparse.REMAINDER,
+        help="clean preload submit  (e.g. `unitccl build all clean submit`)",
+    )
+    sp.set_defaults(func=cmd_build)
 
     sp = sub.add_parser("standalone", help="Run correctness tests (no Slurm).")
     sp.add_argument(
@@ -208,7 +242,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(func=cmd_plot)
 
     sp = sub.add_parser("set", help="Persist a Slurm default (account/partition/qos).")
-    sp.add_argument("what", choices=["account", "partition", "qos"])
+    sp.add_argument("what", choices=["account", "partition", "qos", "nccl_lib"])
     sp.add_argument("value")
     sp.set_defaults(func=cmd_set)
 

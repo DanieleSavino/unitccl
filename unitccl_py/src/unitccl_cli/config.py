@@ -19,6 +19,7 @@ CHECK_ENV = "UNITCCL_CHECK"
 ITERS_ENV = "UNITCCL_ITERS"
 WARMUP_ENV = "UNITCCL_WARMUP"
 NRANKS_ENV = "UNITCCL_NRANKS"  # informational tag set during rank sweeps
+PLACEHOLDER = "UNITCCL_PLACEHOLDER"
 
 # ── default registries (mirrors the current tests.py) ───────────────────────
 DEFAULT_COLLS: Dict[str, bool] = {
@@ -81,13 +82,20 @@ _DEFAULTS = {
 }
 
 
-def load() -> dict:
+def load(ignore_placeholders: bool = False) -> dict:
     cfg = dict(_DEFAULTS)
     if CONFIG_FILE.exists():
         try:
             cfg.update(json.loads(CONFIG_FILE.read_text()))
         except (json.JSONDecodeError, OSError):
             pass
+
+    if ignore_placeholders:
+        return cfg
+
+    for key, value in cfg.items():
+        if value == PLACEHOLDER:
+            raise KeyError(f"config key '{key}' is not set, run `unitccl set {key} <value>`")
     return cfg
 
 
@@ -97,7 +105,7 @@ def save(cfg: dict) -> None:
 
 
 def set_value(key: str, value) -> dict:
-    cfg = load()
+    cfg = load(ignore_placeholders=True)
     cfg[key] = value
     save(cfg)
     return cfg

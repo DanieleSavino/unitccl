@@ -28,6 +28,13 @@ def _require_submitit() -> None:
         )
 
 
+def _run_build_job(target: str, clean: bool, root):
+    """Runs *inside* the submitted Slurm job."""
+    from . import build_utils
+
+    build_utils.run_build(target, clean, root=root)
+
+
 def apply_preload_modules(modules: List[str]) -> None:
     """Load modules in a login shell and merge the resulting env into this
     process. Lets local (non-Slurm) runs pick up the same modules a
@@ -45,9 +52,8 @@ def apply_preload_modules(modules: List[str]) -> None:
             os.environ[k] = v
 
 
-def _executor(job_name: str, nodes: int, tasks_per_node: int, gpus: int, timeout_min: int, log_dir: str):
+def _executor(job_name, nodes, tasks_per_node, gpus, timeout_min, log_dir):
     _require_submitit()
-    cfg = config.load()
     executor = submitit.AutoExecutor(folder=f"{log_dir}/%j")
     params = dict(
         nodes=nodes,
@@ -58,17 +64,28 @@ def _executor(job_name: str, nodes: int, tasks_per_node: int, gpus: int, timeout
     if gpus > 0:
         params["slurm_gres"] = f"gpu:{gpus}"
 
-    if cfg.get("slurm_partition"):
-        params["slurm_partition"] = cfg["slurm_partition"]
-    if cfg.get("slurm_account"):
-        params["slurm_account"] = cfg["slurm_account"]
-    if cfg.get("slurm_qos"):
-        params["slurm_qos"] = cfg["slurm_qos"]
-    modules = cfg.get("preload_modules") or []
-    if modules:
-        params["slurm_setup"] = [
-            "source /etc/profile",
-        ] + [f"module load {m}" for m in modules]
+    slurm_partition = config.get("slurm_partition")
+    if slurm_partition:
+        params["slurm_partition"] = slurm_partition
+
+    slurm_account = config.get("slurm_account")
+    if slurm_account:
+        params["slurm_account"] = slurm_account
+
+    slurm_qos = config.get("slurm_qos")
+    if slurm_qos:
+        params["slurm_qos"] = slurm_qos
+
+    modules = config.get("preload_modules") or []
+    setup = ["source /etc/profile"]
+    setup += [f"module load {m}" for m in modules]
+
+    # ensure the fork's NCCL is found before any module-provided system NCCL
+    nccl_lib = config.get("nccl_lib")
+    if nccl_lib:
+        setup.append(f"export LD_LIBRARY_PATH={nccl_lib}:$LD_LIBRARY_PATH")
+
+    params["slurm_setup"] = setup
     executor.update_parameters(**params)
     return executor
 
@@ -80,7 +97,7 @@ def _run_scaling_for_ranks(ranks: int, scaling_kwargs: dict):
     from . import fastest_iface  # imported here: only needed inside the job
 
     kwargs = dict(scaling_kwargs)
-    kwargs["plot_dir"] = f"{ranks:03d}_ranks"
+    kwargs["plot_dir"] = f"plots/{ranks:03d}_ranks"
     kwargs["do_csv"] = True
     overrides = dict(kwargs.get("env_overrides") or {})
     overrides[config.NRANKS_ENV] = str(ranks)
@@ -108,6 +125,28 @@ def submit_rank_sweep(
         jobs.append(job)
     ok(f"submitted {len(jobs)} jobs (one right-sized alloc per rank count)")
     return jobs
+
+
+def submit_build(
+    target: str,
+    clean: bool = False,
+    timeout_min: int = 60,
+    log_dir: str = "logs/build",
+    gpus: int = 1,
+) -> List:
+    from pathlib import Path
+    """Submit a build (nccl/fastest/unitccl/all) on 1 GPU node.
+
+    Captures the current working directory as `root` at submit time
+    (same idea as `$SLURM_SUBMIT_DIR` in the hand-written sbatch script)
+    so the job builds the same checkout you're calling `unitccl` from.
+    """
+    root = Path.cwd()
+    executor = _executor(f"unitccl-build-{target}", nodes=1, tasks_per_node=1, gpus=gpus, timeout_min=timeout_min, log_dir=log_dir)
+    info(f"submitting build job (target={target} clean={clean})")
+    job = executor.submit(_run_build_job, target, clean, root)
+    ok("submitted 1 job")
+    return [job]
 
 
 def _run_standalone_job():

@@ -106,10 +106,14 @@ def run_scaling(
     rank-sweep runs, where `slurm_utils.submit_rank_sweep` passes
     `<N>_ranks` so csvs land in the layout `plot.py`'s loaders expect.
     """
+    global_rank = int(os.environ.get("SLURM_PROCID", 0))
+    if global_rank != 0:
+        return
+
     load_backend()
     apply_env(check, iters, warmup, env_overrides or {})
 
-    tick_labels = tick_labels or Plotter.SIZES_1KB_64MB
+    tick_labels = tick_labels or ["1kB", "16kB", "256kB", "1MB", "4MB", "64MB"]
     written: List[str] = []
 
     section("scaling comparison")
