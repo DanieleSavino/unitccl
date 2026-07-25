@@ -1,0 +1,17 @@
+nccl_init_ns,nccl_op_ns,gpu_kernel_ns,gpu_kernel_name,gpu_memcpy_ns,gpu_memset_ns,gpu_mem_bytes,network_wait_ns,cuda_api_total_ns,collective,algo,rank
+1242514315.0,23794.5,42448.0,ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>),1344.0,1920.0,1048.576,43247.0,5750.0,bcast,bine,0
+1240131812.0,23005.0,48128.0,ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>),1344.0,2016.0,1048.576,38019.5,5570.0,bcast,bine,1
+1240121783.0,23825.0,53104.0,ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>),1376.0,1856.0,1048.576,27329.75,6720.0,bcast,bine,2
+1240155681.0,25035.0,45696.0,ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>),1376.0,1984.0,1048.576,31480.0,7760.0,bcast,bine,3
+570276491.0,22510.0,28224.0,ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>),1376.0,1792.0,1048.576,43464.75,5520.0,bcast,ring,0
+535870835.0,29564.5,45247.0,ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>),1344.0,1792.0,1048.576,35222.5,6739.5,bcast,ring,1
+568045587.0,23770.0,50144.0,ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>),1376.0,1792.0,1048.576,25737.5,6070.0,bcast,ring,2
+535861586.0,22955.0,49791.5,ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>),1376.0,1792.0,1048.576,26342.0,5700.0,bcast,ring,3
+1059175112.0,23794.5,52656.0,ncclDevKernel_Reduce_Sum_f32_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>),1376.0,2048.0,1048.576,46730.0,5670.0,reduce,bine,0
+1057072687.0,23445.0,28672.0,ncclDevKernel_Reduce_Sum_f32_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>),1376.0,1856.0,1048.576,30757.5,5630.0,reduce,bine,1
+1057134770.0,24215.0,28384.0,ncclDevKernel_Reduce_Sum_f32_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>),1376.0,1952.0,1048.576,36575.0,5690.0,reduce,bine,2
+1057069698.0,24270.0,44479.5,ncclDevKernel_Reduce_Sum_f32_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>),1376.0,1984.0,1048.576,34059.75,5600.0,reduce,bine,3
+676374283.0,22325.0,47872.0,ncclDevKernel_Reduce_Sum_f32_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>),1344.0,1792.0,1048.576,44397.5,5560.0,reduce,ring,0
+673965871.0,22215.0,42528.0,ncclDevKernel_Reduce_Sum_f32_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>),1376.0,1792.0,1048.576,31862.75,5620.0,reduce,ring,1
+674026341.0,22535.5,42608.0,ncclDevKernel_Reduce_Sum_f32_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>),1376.0,1792.0,1048.576,32337.5,6300.0,reduce,ring,2
+673981519.0,28805.0,36928.0,ncclDevKernel_Reduce_Sum_f32_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>),1376.0,1792.0,1048.576,30710.0,6231.0,reduce,ring,3

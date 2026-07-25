@@ -1,0 +1,13 @@
+{
+  "backend_module": "unitccl",
+  "gpus_per_node": 4,
+  "preload_modules": [
+    "cuda/12.2",
+    "openmpi/4.1.6--gcc--12.2.0-cuda-12.2",
+    "cmake/4.1.2",
+    "gcc/12.2.0"
+  ],
+  "slurm_account": null,
+  "slurm_partition": "boost_usr_prod",
+  "slurm_qos": null
+}

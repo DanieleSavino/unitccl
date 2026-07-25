@@ -14,10 +14,22 @@ extern "C" {
 
 static int run_bench(const char *coll, const char *algo, size_t nbytes,
                      FASTEST_TestOutput_t *out) {
+
+    int world_size = 0;
+    const char *ntasks = getenv("SLURM_NTASKS");
+    if (ntasks) {
+	world_size = atoi(ntasks);
+    } else {
+        // fallback if not running under Slurm (e.g. manual mpirun)
+        fprintf(stderr, "SLURM_NTASKS not set\n");
+    }
+
     char cmd[512];
     snprintf(cmd, sizeof(cmd),
-             "NCCL_ALGO=%s mpirun build/unitccl_bench %s %zu 2>&1",
-             algo, coll, nbytes / sizeof(float));
+        "CUDA_VISIBLE_DEVICES=0,1,2,3 NCCL_ALGO=%s "
+        "mpirun -np %d --map-by ppr:4:node "
+	"build/unitccl_bench %s %zu 2>&1",
+	algo, world_size, coll, nbytes / sizeof(float));
 
     FILE *fp = popen(cmd, "r");
     if (!fp) {
@@ -45,8 +57,9 @@ static int run_bench(const char *coll, const char *algo, size_t nbytes,
     }
     int ret = pclose(fp);
     if (ret != 0) {
+        fprintf(stderr, "[bench] pclose failed: %d\n", ret);
         out->exit_status |= FASTEST_ERROR_RESOURCE;
-        return -1;
+        //return -1;
     }
     if (!got_median || !got_status) {
         out->exit_status |= FASTEST_ERROR_UNEXPECTED;
@@ -70,5 +83,6 @@ FASTEST_CUSTOMTEST_INLINE("scaling/1kB_64MB/" algo "_" coll "/" name,          \
     DEFINE_BENCH_TEST(coll, algo, "1kB",   1 * kB) \
     DEFINE_BENCH_TEST(coll, algo, "16kB",  16 * kB) \
     DEFINE_BENCH_TEST(coll, algo, "256kB", 256 * kB) \
+    DEFINE_BENCH_TEST(coll, algo, "1MB", 1 * MB) \
     DEFINE_BENCH_TEST(coll, algo, "4MB",   4 * MB) \
     DEFINE_BENCH_TEST(coll, algo, "64MB",  64 * MB)

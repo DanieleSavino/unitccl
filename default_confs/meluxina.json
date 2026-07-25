@@ -1,0 +1,15 @@
+{
+  "backend_module": "unitccl",
+  "gpus_per_node": 4,
+  "nccl_lib": "UNITCCL_PLACEHOLDER",
+  "preload_modules": [
+    "env/release/2025.1",
+    "OpenMPI/5.0.7-NVHPC-25.3-CUDA-12.8.0",
+    "CUDA/12.8",
+    "GCC/14.2.0",
+    "CMake/3.31.3-GCCcore-14.2.0"
+  ],
+  "slurm_account": "UNITCCL_PLACEHOLDER",
+  "slurm_partition": "gpu",
+  "slurm_qos": "default"
+}

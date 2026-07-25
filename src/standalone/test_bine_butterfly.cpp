@@ -50,7 +50,7 @@ void print_butterfly(int nRanks, int steps, int *partners, int *index, int *orde
 // 1. Partner table is symmetric: partners[r][s] = q  =>  partners[q][s] = r.
 FASTEST_CUSTOMTEST_INLINE("standalone/butterfly/partners_symmetric", FASTEST_FAIL_ERROR, NULL, {
     out->exit_status = FASTEST_SUCCESS;
-    for (int nranks = 2; nranks <= (1<<BINE_MAX_STEPS); nranks *= 2) {
+    for (int nranks = 2; nranks <= 1<<BINE_MAX_STEPS; nranks *= 2) {
         int steps = __builtin_ctz(nranks);
         int *partners = (int*) malloc(nranks * steps * sizeof(int));
         int *index    = (int*) malloc(nranks * sizeof(int));
