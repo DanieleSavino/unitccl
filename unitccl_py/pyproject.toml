@@ -11,10 +11,11 @@ requires-python = ">=3.9"
 dependencies = [
     "pandas>=1.5",
     "matplotlib>=3.6",
+    "submitit>=1.5",
 ]
 
 [project.optional-dependencies]
-slurm = ["submitit>=1.5"]
+tui = ["rich>=13.0"]
 
 # NOTE: the import package is `unitccl_cli`, not `unitccl` -- the compiled
 # per-project fastest/pybind11 backend extension is what's traditionally

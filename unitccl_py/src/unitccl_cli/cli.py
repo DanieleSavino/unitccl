@@ -140,7 +140,7 @@ def cmd_scaling(args) -> None:
 
 
 def cmd_nsys(args) -> None:
-    from . import nsys_utils
+    from . import slurm_utils
 
     positional = [a for a in args.rest if "=" not in a and a not in {"check"}]
     parsed = _parse_kv_tokens(args.rest)
@@ -150,23 +150,17 @@ def cmd_nsys(args) -> None:
     colls = sorted(filters["coll"]) if filters["coll"] else ["Bcast", "Reduce"]
     algos = sorted(filters["algo"]) if filters["algo"] else ["BINE", "RING"]
     proto = sorted(filters["proto"])[0] if filters["proto"] else "SIMPLE"
-    size = int(kv.get("size", 16777216))
-    nranks = int(kv.get("nranks", 8))
+    sizes = [int(s) for s in kv.get("size", "16777216").split(",")]
+    nranks_list = [int(r) for r in kv.get("nranks", "8").split(",")]
     check = "check" in flags or kv.get("check", "").lower() in ("1", "true", "on")
 
-    nsys_utils.run_profiles(
-        outdir,
-        colls,
-        algos,
-        size=size,
-        nranks=nranks,
-        proto=proto,
+    jobs = slurm_utils.submit_nsys_sweep(
+        outdir, colls, algos, sizes=sizes, ranks_list=nranks_list, proto=proto,
         warmup=_int_or_none(kv, "warmup"),
         iters=_int_or_none(kv, "iters"),
         check=check,
     )
-    nsys_utils.generate_stats(outdir)
-    nsys_utils.analyze(outdir)
+    slurm_utils.wait_for(jobs)
 
 
 def cmd_plot(args) -> None:

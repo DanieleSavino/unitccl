@@ -149,6 +149,112 @@ def submit_build(
     return [job]
 
 
+def _run_nsys_job(outdir_str, colls, algos, sizes, nranks, proto, warmup, iters, check):
+    """Runs *inside* the submitted Slurm job. Loops over all sizes within
+    this single allocation -- one nsys/stats/analyze pass per size, each
+    writing to its own `<outdir>/<size>/` subdir."""
+    from pathlib import Path
+    from . import nsys_utils
+
+    import os
+    rank = int(os.environ.get("SLURM_PROCID", 0))
+    if rank != 0:
+        return
+
+    gpus_per_node = config.get("gpus_per_node", 4)
+    env_overrides = dict(os.environ)
+    env_overrides[config.NRANKS_ENV] = str(nranks)
+    env_overrides["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in range(gpus_per_node))
+
+    base_outdir = Path(outdir_str)
+    for size in sizes:
+        outdir = base_outdir / _human_size(size)
+        nsys_utils.run_profiles(
+            outdir, colls, algos,
+            size=size, nranks=nranks, proto=proto,
+            warmup=warmup, iters=iters, check=check, env_overrides=env_overrides,
+        )
+        nsys_utils.generate_stats(outdir)
+        nsys_utils.analyze(outdir)
+
+
+def submit_nsys(
+    outdir,
+    colls: List[str],
+    algos: List[str],
+    sizes: List[int],
+    nranks: int,
+    proto: str = "SIMPLE",
+    warmup: Optional[int] = None,
+    iters: Optional[int] = None,
+    check: bool = False,
+    gpus_per_node: Optional[int] = None,
+    timeout_min: int = 60,
+    log_dir: str = "logs/nsys",
+) -> List:
+    """One task per node, holding the full per-node GPU gres, so the
+    nested `mpirun -n nranks` inside _run_nsys_job sees the whole
+    allocation. All `sizes` are profiled sequentially within this single
+    allocation -- do NOT split per size, that would waste a fresh alloc
+    for a knob that doesn't change node/gpu requirements at all."""
+    gpus_per_node = gpus_per_node or config.get("gpus_per_node", 4)
+    nodes = max(1, -(-nranks // gpus_per_node))  # ceil division
+    executor = _executor(
+        f"unitccl-nsys-{nranks}", nodes, tasks_per_node=gpus_per_node, gpus=gpus_per_node,
+        timeout_min=timeout_min, log_dir=log_dir,
+    )
+    info(f"submitting nsys job nranks={nranks} nodes={nodes} gpus/node={gpus_per_node} sizes={sizes} (1 task/node)")
+    job = executor.submit(
+        _run_nsys_job, str(outdir), colls, algos, sizes, nranks, proto, warmup, iters, check
+    )
+    ok("submitted 1 job")
+    return [job]
+
+
+def _human_size(n: int) -> str:
+    """1048576 -> '1MB', 16777216 -> '16MB', 1024 -> '1kB'. Falls back to
+    raw byte count (e.g. '1500B') if it doesn't divide evenly."""
+    n *= 4
+    for unit, factor in (("GB", 1024**3), ("MB", 1024**2), ("kB", 1024)):
+        if n % factor == 0:
+            return f"{n // factor}{unit}"
+    return f"{n}B"
+
+
+def submit_nsys_sweep(
+    outdir,
+    colls: List[str],
+    algos: List[str],
+    sizes: List[int],
+    ranks_list: List[int],
+    proto: str = "SIMPLE",
+    warmup: Optional[int] = None,
+    iters: Optional[int] = None,
+    check: bool = False,
+    gpus_per_node: Optional[int] = None,
+    timeout_min: int = 60,
+    log_dir: str = "logs/nsys",
+) -> List:
+    """One right-sized submitit job per rank count -- all sizes are profiled
+    sequentially inside that same allocation (size doesn't change the alloc
+    shape, so splitting per-size would just waste separate allocations).
+    Sub-outdirs follow `<outdir>/<nranks>_ranks/<size>/`."""
+    from pathlib import Path
+
+    jobs = []
+    for nranks in ranks_list:
+        sub_outdir = Path(outdir) / f"{nranks:03d}_ranks"
+        jobs.extend(
+            submit_nsys(
+                sub_outdir, colls, algos, sizes=sizes, nranks=nranks, proto=proto,
+                warmup=warmup, iters=iters, check=check,
+                gpus_per_node=gpus_per_node, timeout_min=timeout_min, log_dir=log_dir,
+            )
+        )
+    ok(f"submitted {len(jobs)} nsys jobs ({len(ranks_list)} rank counts, {len(sizes)} sizes each, one alloc per rank count)")
+    return jobs
+
+
 def _run_standalone_job():
     """Runs *inside* the submitted Slurm job."""
     from . import fastest_iface  # imported here: only needed inside the job
