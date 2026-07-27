@@ -1,6 +1,7 @@
 {
   "backend_module": "unitccl",
   "gpus_per_node": 4,
+  "nccl_lib": "UNITCCL_PLACEHOLDER",
   "preload_modules": [
     "cuda/12.2",
     "openmpi/4.1.6--gcc--12.2.0-cuda-12.2",
