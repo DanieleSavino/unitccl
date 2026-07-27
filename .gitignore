@@ -8,6 +8,7 @@ __pycache__/
 *.pyc
 *.egg-info/
 pyrightconfig.json
+stubs/
 
 # pybind extension (built locally)
 vendor/fastest/bindings/*.so
