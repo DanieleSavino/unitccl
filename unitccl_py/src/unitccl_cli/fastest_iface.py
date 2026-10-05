@@ -49,12 +49,26 @@ def apply_env(
         os.environ[k] = v
 
 
-def run_standalone(env_overrides: Optional[Dict[str, str]] = None) -> None:
+def run_standalone(
+    env_overrides: Optional[Dict[str, str]] = None, 
+    buffmans: Optional[List[str]] = None
+) -> None:
     backend = load_backend()
-    apply_env(check=True, iters=None, warmup=None, overrides=env_overrides or {})
-    section("standalone correctness")
-    for test in backend.get_subtests("standalone"):
-        fastest.run_log(test["test_name"])
+    active_buffmans = buffmans if (buffmans and len(buffmans) > 0) else [""]
+    
+    for buff in active_buffmans:
+        curr_env = dict(env_overrides or {})
+        if buff:
+            section(f"standalone correctness — BINE BUFFER MAN: {buff}")
+            curr_env[config.BINE_BUFFER_MANAGEMENT_ENV] = buff
+        else:
+            section("standalone correctness")
+            if config.BINE_BUFFER_MANAGEMENT_ENV in os.environ:
+                del os.environ[config.BINE_BUFFER_MANAGEMENT_ENV]
+            
+        apply_env(check=True, iters=None, warmup=None, overrides=curr_env)
+        for test in backend.get_subtests("standalone"):
+            fastest.run_log(test["test_name"])
 
 
 def _make_plotter(coll: str, proto: str, tick_labels) -> Plotter:
@@ -99,6 +113,7 @@ def run_scaling(
     n_repeats: int = 1,
     plot_dir: str = PLOT_DIR,
     env_overrides: Optional[Dict[str, str]] = None,
+    buffmans: Optional[Set[str]] = None,
     tick_labels=None,
 ) -> List[str]:
     """Port of the current `tests.py` scaling block. Returns csv paths written.
@@ -112,14 +127,13 @@ def run_scaling(
         return []
 
     load_backend()
-    apply_env(check, iters, warmup, env_overrides or {})
-
     tick_labels = tick_labels or ["1kB", "16kB", "256kB", "1MB", "4MB", "64MB"]
     written: List[str] = []
 
     section("scaling comparison")
     active_colls = config.active(config.DEFAULT_COLLS, colls)
     active_protos = config.active(config.DEFAULT_PROTOS, protos)
+    active_buffmans = sorted(list(buffmans)) if buffmans else [""]
 
     for coll in active_colls:
         coll_algos = config.active(config.DEFAULT_ALGOS.get(coll, {}), algos)
@@ -131,31 +145,44 @@ def run_scaling(
         baseline_algo = coll_algos[0]
 
         for proto in active_protos:
-            os.environ["NCCL_PROTO"] = proto
-            print(color(f"\n  {coll}  proto={proto}  algos={coll_algos}", "blue"))
+            for buffman in active_buffmans:
+                curr_env = dict(env_overrides or {})
+                if buffman:
+                    curr_env[config.BINE_BUFFER_MANAGEMENT_ENV] = buffman
+                    effective_proto = f"{proto}_{buffman}"
+                    label_proto = f"{proto} ({buffman})"
+                else:
+                    if config.BINE_BUFFER_MANAGEMENT_ENV in os.environ:
+                        del os.environ[config.BINE_BUFFER_MANAGEMENT_ENV]
+                    effective_proto = proto
+                    label_proto = proto
+                
+                os.environ["NCCL_PROTO"] = proto
+                apply_env(check, iters, warmup, curr_env)
 
-            cmp = fastest.compare(*pools.values(), n_repeats=n_repeats)
-            cmp.report()
+                print(color(f"\n  {coll}  proto={label_proto}  algos={coll_algos}", "blue"))
 
-            file_dir = f"{plot_dir}/{coll}"
-            if do_csv:
-                os.makedirs(file_dir, exist_ok=True)
-                csv_path = f"{file_dir}/{coll}_{proto}.csv"
-                cmp.save_csv(csv_path)
-                written.append(csv_path)
-                print(color(f"   saved → {csv_path}", "dim"))
+                cmp = fastest.compare(*pools.values(), n_repeats=n_repeats)
+                cmp.report()
 
-            if do_plot:
-                os.makedirs(file_dir, exist_ok=True)
+                file_dir = f"{plot_dir}/{coll}"
+                if do_csv:
+                    os.makedirs(file_dir, exist_ok=True)
+                    csv_path = f"{file_dir}/{coll}_{effective_proto}.csv"
+                    cmp.save_csv(csv_path)
+                    written.append(csv_path)
+                    print(color(f"   saved → {csv_path}", "dim"))
 
-                png_path = f"{file_dir}/{coll}_{proto}.png"
-                _make_plotter(coll, proto, tick_labels).plot(cmp, png_path, PlotMode.MEDIAN)
-                print(color(f"   saved → {png_path}", "dim"))
+                if do_plot:
+                    os.makedirs(file_dir, exist_ok=True)
+                    png_path = f"{file_dir}/{coll}_{effective_proto}.png"
+                    _make_plotter(coll, label_proto, tick_labels).plot(cmp, png_path, PlotMode.MEDIAN)
+                    print(color(f"   saved → {png_path}", "dim"))
 
-                diff_path = f"{file_dir}/{coll}_{proto}_diff.png"
-                _make_diff_plotter(coll, proto, baseline_algo, tick_labels).plot(
-                    cmp, diff_path, PlotMode.MEDIAN, PlotTransform.DIFF
-                )
-                print(color(f"   saved → {diff_path}", "dim"))
+                    diff_path = f"{file_dir}/{coll}_{effective_proto}_diff.png"
+                    _make_diff_plotter(coll, label_proto, baseline_algo, tick_labels).plot(
+                        cmp, diff_path, PlotMode.MEDIAN, PlotTransform.DIFF
+                    )
+                    print(color(f"   saved → {diff_path}", "dim"))
 
-    return written
+    return written   return written

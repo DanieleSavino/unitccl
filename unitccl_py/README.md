@@ -1,4 +1,4 @@
-# unitccl_py
+# unitccl_p# unitccl_py
 
 CLI + library that consolidates `tests.py`, `scaling.py` (the `<N>_ranks`
 plotting script), `nsys.py` (`02_analyze_and_plot.py`), `generate_stats.sh`,
@@ -76,7 +76,7 @@ src/unitccl_cli/
 unitccl standalone
 unitccl standalone preload      # apply preload_modules, then run locally
 unitccl standalone submit       # run on 1 allocated node, no GPU
-unitccl standalone --bine-buffer-management SEND  # override NCCL_BINE_BUFFER_MANAGEMENT
+unitccl standalone --buffman SEND,DOUBLE_SEND  # override NCCL_BINE_BUFFER_MANAGEMENT
 
 # Build nccl / fastest / unitccl / all.
 unitccl build unitccl
@@ -84,7 +84,7 @@ unitccl build all --clean --submit  # clean build, submitted as a Slurm job
 unitccl build nccl --preload        # apply preload_modules, then build locally
 
 # Scaling comparison via fastest pools (matches the original tests.py behavior).
-unitccl scaling --coll Bcast,AllReduce --algo BINE,RING --proto SIMPLE --plot --csv --check --warmup 10 --iters 40 --bine-buffer-management SEND
+unitccl scaling --coll Bcast,AllReduce --algo BINE,RING --proto SIMPLE --plot --csv --check --warmup 10 --iters 40 --buffman SEND,BLOCK_BY_BLOCK
 
 # Same, but swept across rank counts: submits one independently-sized
 # submitit/Slurm job per rank count (no shared oversized allocation), then
@@ -95,7 +95,7 @@ unitccl scaling --coll Bcast --proto SIMPLE --csv --ranks 4,8,16,32,64,128
 
 # Capture nsys profiles for BINE vs RING, export nsys-stats CSVs, and
 # generate the bine-vs-ring comparison plots -- all in one call.
-unitccl nsys --outdir nsys_out --coll Bcast,Reduce --algo BINE,RING --proto SIMPLE --size 16777216 --nranks 8 --warmup 10 --iters 40 --check --bine-buffer-management DOUBLE_SEND
+unitccl nsys --outdir nsys_out --coll Bcast,Reduce --algo BINE,RING --proto SIMPLE --size 16777216 --nranks 8 --warmup 10 --iters 40 --check --buffman SEND,DOUBLE_SEND
 
 # Plot a rank sweep already on disk.
 unitccl plot ranks --root . --collective Bcast,AllReduce --proto SIMPLE,LL
@@ -187,4 +187,4 @@ plots/
 
 `<N>_ranks/<Coll>/<Coll>_<PROTO>.csv` is what the submitit sweep jobs write
 directly; `plotting.py` reads those csvs back for both `plot ranks` and
-`plot size`, and `nsys_utils.py` owns the `nsys/`-shaped subtree above.
+`plot size`, and `nsys_utils.py` owns the `nsys/`-shaped subtree above.s_utils.py` owns the `nsys/`-shaped subtree above.

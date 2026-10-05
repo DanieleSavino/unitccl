@@ -1,9 +1,9 @@
 """unitccl command-line entrypoint.
 
-    unitccl standalone <preload> <submit> [--bine-buffer-management MODE]
-    unitccl scaling --coll Bcast,AllReduce --algo BINE,RING --proto SIMPLE --plot --csv --check --warmup 10 --iters 40 --bine-buffer-management SEND
+    unitccl standalone <preload> <submit> [--buffman SEND,DOUBLE_SEND]
+    unitccl scaling --coll Bcast,AllReduce --algo BINE,RING --proto SIMPLE --plot --csv --check --warmup 10 --iters 40 --buffman SEND,BLOCK_BY_BLOCK
     unitccl scaling --coll Bcast --proto SIMPLE --csv --ranks 4,8,16,32,64,128
-    unitccl nsys --outdir nsys --coll Bcast,Reduce --algo BINE,RING --proto SIMPLE --size 16777216 --nranks 8 --warmup 10 --iters 40 --check --bine-buffer-management DOUBLE_SEND
+    unitccl nsys --outdir nsys --coll Bcast,Reduce --algo BINE,RING --proto SIMPLE --size 16777216 --nranks 8 --warmup 10 --iters 40 --check --buffman DOUBLE_SEND
     unitccl plot ranks --root . --collective Bcast,AllReduce --proto SIMPLE,LL [--size 4MB]
     unitccl plot size  --root . --collective Bcast --proto SIMPLE
     unitccl set account <value>
@@ -22,8 +22,6 @@ from typing import List, Optional
 
 from . import config
 from .logging_utils import error, ok
-
-BINE_BUFFER_CHOICES = ["BLOCK_BY_BLOCK", "SEND", "DOUBLE_SEND", "PERMUTATION"]
 
 # ── subcommands ──────────────────────────────────────────────────────────────
 
@@ -49,7 +47,9 @@ def cmd_standalone(args) -> None:
 
     if args.mode == "submit":
         from . import slurm_utils
-        jobs = slurm_utils.submit_standalone()
+        jobs = slurm_utils.submit_standalone(
+            buffmans=args.buffman.split(",") if args.buffman else None
+        )
         slurm_utils.wait_for(jobs)
         return
 
@@ -58,11 +58,8 @@ def cmd_standalone(args) -> None:
         cfg = config.load()
         slurm_utils.apply_preload_modules(cfg.get("preload_modules") or [])
         
-    env_overrides = {}
-    if args.bine_buffer_management:
-        env_overrides[config.BINE_BUFFER_MANAGEMENT_ENV] = args.bine_buffer_management
-
-    fastest_iface.run_standalone(env_overrides=env_overrides)
+    buffmans = args.buffman.split(",") if args.buffman else None
+    fastest_iface.run_standalone(buffmans=buffmans)
 
 
 def cmd_preload_add(args) -> None:
@@ -82,10 +79,6 @@ def cmd_preload_rm(args) -> None:
 def cmd_scaling(args) -> None:
     from . import fastest_iface, slurm_utils
     
-    env_overrides = {}
-    if args.bine_buffer_management:
-        env_overrides[config.BINE_BUFFER_MANAGEMENT_ENV] = args.bine_buffer_management
-
     scaling_kwargs = dict(
         colls=set(args.coll.split(",")) if args.coll else None,
         algos=set(args.algo.split(",")) if args.algo else None,
@@ -95,7 +88,7 @@ def cmd_scaling(args) -> None:
         check=args.check,
         warmup=args.warmup,
         iters=args.iters,
-        env_overrides=env_overrides,
+        buffmans=set(args.buffman.split(",")) if args.buffman else None,
     )
 
     if args.ranks:
@@ -114,17 +107,14 @@ def cmd_nsys(args) -> None:
     proto = args.proto.split(",")[0] if args.proto else "SIMPLE"
     sizes = [int(s) for s in args.size.split(",")]
     nranks_list = [int(r) for r in args.nranks.split(",")]
+    buffmans = args.buffman.split(",") if args.buffman else None
     
-    env_overrides = {}
-    if args.bine_buffer_management:
-        env_overrides[config.BINE_BUFFER_MANAGEMENT_ENV] = args.bine_buffer_management
-
     jobs = slurm_utils.submit_nsys_sweep(
         args.outdir, colls, algos, sizes=sizes, ranks_list=nranks_list, proto=proto,
         warmup=args.warmup,
         iters=args.iters,
         check=args.check,
-        env_overrides=env_overrides
+        buffmans=buffmans
     )
     slurm_utils.wait_for(jobs)
 
@@ -167,7 +157,7 @@ def build_parser() -> argparse.ArgumentParser:
         "mode", nargs="?", choices=["preload", "submit"], default=None,
         help="preload: apply preload_modules then run locally. submit: run on 1 allocated node, no GPU.",
     )
-    sp.add_argument("--bine-buffer-management", choices=BINE_BUFFER_CHOICES, help="NCCL_BINE_BUFFER_MANAGEMENT override")
+    sp.add_argument("--buffman", help="Comma-separated buffer management modes (BLOCK_BY_BLOCK, SEND, DOUBLE_SEND, PERMUTATION)")
     sp.set_defaults(func=cmd_standalone)
 
     sp = sub.add_parser("scaling", help="Run scaling comparisons via fastest pools.")
@@ -180,7 +170,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--warmup", type=int, help="Number of warmup iterations")
     sp.add_argument("--iters", type=int, help="Number of measured iterations")
     sp.add_argument("--ranks", help="Comma-separated rank counts (triggers Slurm sweep)")
-    sp.add_argument("--bine-buffer-management", choices=BINE_BUFFER_CHOICES, help="NCCL_BINE_BUFFER_MANAGEMENT override")
+    sp.add_argument("--buffman", help="Comma-separated buffer management modes")
     sp.set_defaults(func=cmd_scaling)
 
     sp = sub.add_parser("nsys", help="Capture nsys profiles, generate stats, and analyze.")
@@ -193,7 +183,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--warmup", type=int, help="Number of warmup iterations")
     sp.add_argument("--iters", type=int, help="Number of measured iterations")
     sp.add_argument("--check", action="store_true", help="Enable correctness verification")
-    sp.add_argument("--bine-buffer-management", choices=BINE_BUFFER_CHOICES, help="NCCL_BINE_BUFFER_MANAGEMENT override")
+    sp.add_argument("--buffman", help="Comma-separated buffer management modes")
     sp.set_defaults(func=cmd_nsys)
 
     sp = sub.add_parser("plot", help="Plot rank-sweep data (time vs size, or time vs ranks).")

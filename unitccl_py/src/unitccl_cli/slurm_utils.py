@@ -1,5 +1,4 @@
-"""Submitit-based Slurm helpers.
-
+"""Submitit-based Slurm helpers Submitit-based Slurm helpers.
 Each rank count in a sweep gets its own, independently-sized `sbatch`
 submission -- there is never one oversized allocation held for the whole
 sweep. This directly replaces hand-written per-rank-count sbatch scripts
@@ -92,7 +91,7 @@ def _executor(job_name, nodes, tasks_per_node, gpus, timeout_min, log_dir):
 
 def _run_scaling_for_ranks(ranks: int, scaling_kwargs: dict):
     """Runs *inside* the submitted Slurm job: one rank count, writes csvs to
-    `<ranks>_ranks/<coll>/<coll>_<proto>.csv` (the layout `plotting.py`'s
+    `<ranks>_ranks/<coll>/<coll>_<proto>.csv` (the layout `plotting.py`
     loaders expect)."""
     from . import fastest_iface  # imported here: only needed inside the job
 
@@ -144,7 +143,7 @@ def submit_build(
     return [job]
 
 
-def _run_nsys_job(outdir_str, colls, algos, sizes, nranks, proto, warmup, iters, check, env_overrides=None):
+def _run_nsys_job(outdir_str, colls, algos, sizes, nranks, proto, warmup, iters, check, buffmans=None, env_overrides=None):
     from pathlib import Path
     from . import nsys_utils
 
@@ -161,15 +160,26 @@ def _run_nsys_job(outdir_str, colls, algos, sizes, nranks, proto, warmup, iters,
     job_env_overrides["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in range(gpus_per_node))
 
     base_outdir = Path(outdir_str)
+    active_buffmans = buffmans if buffmans else [""]
+
     for size in sizes:
-        outdir = base_outdir / _human_size(size)
-        nsys_utils.run_profiles(
-            outdir, colls, algos,
-            size=size, nranks=nranks, proto=proto,
-            warmup=warmup, iters=iters, check=check, env_overrides=job_env_overrides,
-        )
-        nsys_utils.generate_stats(outdir)
-        nsys_utils.analyze(outdir)
+        for buffman in active_buffmans:
+            job_env_copy = dict(job_env_overrides)
+            if buffman:
+                job_env_copy[config.BINE_BUFFER_MANAGEMENT_ENV] = buffman
+                outdir = base_outdir / _human_size(size) / buffman
+            else:
+                outdir = base_outdir / _human_size(size)
+                if config.BINE_BUFFER_MANAGEMENT_ENV in job_env_copy:
+                    del job_env_copy[config.BINE_BUFFER_MANAGEMENT_ENV]
+                    
+            nsys_utils.run_profiles(
+                outdir, colls, algos,
+                size=size, nranks=nranks, proto=proto,
+                warmup=warmup, iters=iters, check=check, env_overrides=job_env_copy,
+            )
+            nsys_utils.generate_stats(outdir)
+            nsys_utils.analyze(outdir)
 
 
 def submit_nsys(
@@ -182,6 +192,7 @@ def submit_nsys(
     warmup: Optional[int] = None,
     iters: Optional[int] = None,
     check: bool = False,
+    buffmans: Optional[List[str]] = None,
     env_overrides: Optional[Dict[str, str]] = None,
     gpus_per_node: Optional[int] = None,
     timeout_min: int = 60,
@@ -195,7 +206,7 @@ def submit_nsys(
     )
     info(f"submitting nsys job nranks={nranks} nodes={nodes} gpus/node={gpus_per_node} sizes={sizes} (1 task/node)")
     job = executor.submit(
-        _run_nsys_job, str(outdir), colls, algos, sizes, nranks, proto, warmup, iters, check, env_overrides
+        _run_nsys_job, str(outdir), colls, algos, sizes, nranks, proto, warmup, iters, check, buffmans, env_overrides
     )
     ok("submitted 1 job")
     return [job]
@@ -219,6 +230,7 @@ def submit_nsys_sweep(
     warmup: Optional[int] = None,
     iters: Optional[int] = None,
     check: bool = False,
+    buffmans: Optional[List[str]] = None,
     env_overrides: Optional[Dict[str, str]] = None,
     gpus_per_node: Optional[int] = None,
     timeout_min: int = 60,
@@ -232,7 +244,7 @@ def submit_nsys_sweep(
         jobs.extend(
             submit_nsys(
                 sub_outdir, colls, algos, sizes=sizes, nranks=nranks, proto=proto,
-                warmup=warmup, iters=iters, check=check, env_overrides=env_overrides,
+                warmup=warmup, iters=iters, check=check, buffmans=buffmans, env_overrides=env_overrides,
                 gpus_per_node=gpus_per_node, timeout_min=timeout_min, log_dir=log_dir,
             )
         )
@@ -240,15 +252,20 @@ def submit_nsys_sweep(
     return jobs
 
 
-def _run_standalone_job(env_overrides: Optional[Dict[str, str]] = None):
+def _run_standalone_job(buffmans: Optional[List[str]] = None, env_overrides: Optional[Dict[str, str]] = None):
     from . import fastest_iface
-    fastest_iface.run_standalone(env_overrides=env_overrides)
+    fastest_iface.run_standalone(env_overrides=env_overrides, buffmans=buffmans)
 
 
-def submit_standalone(timeout_min: int = 30, log_dir: str = "logs/standalone", env_overrides: Optional[Dict[str, str]] = None) -> List:
+def submit_standalone(
+    buffmans: Optional[List[str]] = None, 
+    timeout_min: int = 30, 
+    log_dir: str = "logs/standalone", 
+    env_overrides: Optional[Dict[str, str]] = None
+) -> List:
     executor = _executor("unitccl-standalone", nodes=1, tasks_per_node=1, gpus=0, timeout_min=timeout_min, log_dir=log_dir)
     info("submitting standalone job (1 node, no gpu)")
-    job = executor.submit(_run_standalone_job, env_overrides)
+    job = executor.submit(_run_standalone_job, buffmans, env_overrides)
     ok("submitted 1 job")
     return [job]
 
