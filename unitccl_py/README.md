@@ -1,4 +1,4 @@
-# unitccl_p# unitccl_py
+# unitccl_py
 
 CLI + library that consolidates `tests.py`, `scaling.py` (the `<N>_ranks`
 plotting script), `nsys.py` (`02_analyze_and_plot.py`), `generate_stats.sh`,
