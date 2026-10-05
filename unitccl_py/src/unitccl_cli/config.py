@@ -20,6 +20,7 @@ ITERS_ENV = "UNITCCL_ITERS"
 WARMUP_ENV = "UNITCCL_WARMUP"
 NRANKS_ENV = "UNITCCL_NRANKS"  # informational tag set during rank sweeps
 PLACEHOLDER = "UNITCCL_PLACEHOLDER"
+BINE_BUFFER_MANAGEMENT_ENV = "NCCL_BINE_BUFFER_MANAGEMENT"
 
 # ── default registries (mirrors the current tests.py) ───────────────────────
 DEFAULT_COLLS: Dict[str, bool] = {
@@ -118,6 +119,7 @@ def get(key: str, default=None):
 def active(d: Dict[str, bool], filter_set: Optional[Set[str]] = None) -> List[str]:
     """Names whose flag is True, optionally restricted to `filter_set`."""
     return [k for k, v in d.items() if v and (filter_set is None or k in filter_set)]
+
 
 def add_preload_module(module: str) -> dict:
     """Append a module to the preload list, preserving insertion order, no dupes."""

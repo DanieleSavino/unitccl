@@ -28,8 +28,8 @@ Core, installed with plain `pip install -e .`:
 
 - `pandas>=1.5`
 - `matplotlib>=3.6`
-- `submitit>=1.5` -- Slurm job submission (`ranks=...` sweeps, `build ...
-  submit`, `standalone submit`)
+- `submitit>=1.5` -- Slurm job submission (`--ranks=...` sweeps, `build ...
+  --submit`, `standalone submit`)
 
 Optional, via `pip install -e '.[tui]'`:
 
@@ -76,31 +76,32 @@ src/unitccl_cli/
 unitccl standalone
 unitccl standalone preload      # apply preload_modules, then run locally
 unitccl standalone submit       # run on 1 allocated node, no GPU
+unitccl standalone --bine-buffer-management SEND  # override NCCL_BINE_BUFFER_MANAGEMENT
 
 # Build nccl / fastest / unitccl / all.
 unitccl build unitccl
-unitccl build all clean submit  # clean build, submitted as a Slurm job
-unitccl build nccl preload      # apply preload_modules, then build locally
+unitccl build all --clean --submit  # clean build, submitted as a Slurm job
+unitccl build nccl --preload        # apply preload_modules, then build locally
 
 # Scaling comparison via fastest pools (matches the original tests.py behavior).
-unitccl scaling coll=Bcast,AllReduce algo=BINE,RING proto=SIMPLE plot csv check warmup=10 iters=40
+unitccl scaling --coll Bcast,AllReduce --algo BINE,RING --proto SIMPLE --plot --csv --check --warmup 10 --iters 40 --bine-buffer-management SEND
 
 # Same, but swept across rank counts: submits one independently-sized
 # submitit/Slurm job per rank count (no shared oversized allocation), then
 # writes csvs to <N>_ranks/<coll>/<coll>_<proto>.csv for `unitccl plot` to
 # read. Submitting drops you into a live TUI dashboard (see below) that
 # blocks until every job finishes.
-unitccl scaling coll=Bcast proto=SIMPLE csv ranks=4,8,16,32,64,128
+unitccl scaling --coll Bcast --proto SIMPLE --csv --ranks 4,8,16,32,64,128
 
 # Capture nsys profiles for BINE vs RING, export nsys-stats CSVs, and
 # generate the bine-vs-ring comparison plots -- all in one call.
-unitccl nsys nsys_out coll=Bcast,Reduce algo=BINE,RING proto=SIMPLE size=16777216 nranks=8 warmup=10 iters=40 check
+unitccl nsys --outdir nsys_out --coll Bcast,Reduce --algo BINE,RING --proto SIMPLE --size 16777216 --nranks 8 --warmup 10 --iters 40 --check --bine-buffer-management DOUBLE_SEND
 
 # Plot a rank sweep already on disk.
 unitccl plot ranks --root . --collective Bcast,AllReduce --proto SIMPLE,LL
 unitccl plot size  --root . --collective Bcast --proto SIMPLE
 
-# Persist Slurm defaults used by `ranks=...` sweeps and (optionally) nsys jobs.
+# Persist Slurm defaults used by `--ranks=...` sweeps and (optionally) nsys jobs.
 unitccl set account p201236
 unitccl set partition boost_usr_prod
 unitccl set qos default
@@ -128,7 +129,7 @@ commands above with those values) when switching clusters.
 
 ## Live job dashboard
 
-Submitting anything through Slurm (`ranks=...` sweeps, `build ... submit`,
+Submitting anything through Slurm (`--ranks=...` sweeps, `build ... --submit`,
 `standalone submit`) hands off to `tui_utils.watch_jobs`, which -- if `rich`
 is installed and stdout is a real terminal -- renders a live table (job id,
 state, rank count, elapsed time, a throttled `squeue --start` ETA for
@@ -151,13 +152,13 @@ loop, with no keyboard controls.
 
 ## Output layout
 
-A `ranks=... plot` sweep, followed by `unitccl plot ranks` and/or `unitccl
+A `--ranks=...` plot sweep, followed by `unitccl plot ranks` and/or `unitccl
 nsys`, produces (paths relative to wherever you ran `unitccl` from, or
 `--outdir` for `plot`/`nsys`):
 
 ```
 plots/
-├── 004_ranks/                          # one folder per `ranks=` value, %03d-padded
+├── 004_ranks/                          # one folder per `--ranks=` value, %03d-padded
 │   ├── Bcast/
 │   │   ├── Bcast_SIMPLE.csv            # written directly by the sweep job
 │   │   ├── Bcast_SIMPLE.png            # written by `unitccl plot`
