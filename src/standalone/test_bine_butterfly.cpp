@@ -135,8 +135,10 @@ FASTEST_CUSTOMTEST_INLINE("standalone/butterfly/virt_index_is_permutation", FAST
     }
 });
 
-// 4. At each step, partners differ by exactly bit `step` in their virtual index.
-FASTEST_CUSTOMTEST_INLINE("standalone/butterfly/partners_differ_by_one_bit", FASTEST_FAIL_ERROR, NULL, {
+// 4. At step s, the partner agrees with r on virtual-index bits below s and
+//    differs at bit s. Higher bits are free. (Replaces "partners_differ_by_one_bit":
+//    index[r] ^ index[q] == 1 << s holds only for the tree rooted at rank 0.)
+FASTEST_CUSTOMTEST_INLINE("standalone/butterfly/partner_matches_below_differs_at_step_bit", FASTEST_FAIL_ERROR, NULL, {
     out->exit_status = FASTEST_SUCCESS;
     for (int nranks = 2; nranks <= (1<<BINE_MAX_STEPS); nranks *= 2) {
         int steps = __builtin_ctz(nranks);
@@ -149,10 +151,11 @@ FASTEST_CUSTOMTEST_INLINE("standalone/butterfly/partners_differ_by_one_bit", FAS
             for (int _s = 0; _s < steps; _s++) {
                 int q = partners[idx(_r, _s, steps)];
                 if (q < 0) continue;
-                int diff = index[_r] ^ index[q];
+                int low = (2 << _s) - 1;  /* bits 0.._s */
+                int diff = (index[_r] ^ index[q]) & low;
                 if (diff != (1 << _s)) {
-                    printf("  [butterfly/partners_differ_by_one_bit] FAIL nranks=%d r=%d s=%d: virt xor=0x%x expected 0x%x\n",
-                           nranks, _r, _s, diff, 1 << _s);
+                    printf("  [butterfly/partner_matches_below_differs_at_step_bit] FAIL nranks=%d r=%d s=%d: (virt xor)&0x%x=0x%x expected 0x%x\n",
+                           nranks, _r, _s, low, diff, 1 << _s);
                     out->exit_status = FASTEST_ERROR_ASSERT;
                     goto fail;
                 }
@@ -201,6 +204,39 @@ FASTEST_CUSTOMTEST_INLINE("standalone/butterfly/no_idle_slots", FASTEST_FAIL_ERR
                 if (partners[idx(_r, _s, steps)] < 0) {
                     printf("  [butterfly/no_idle_slots] FAIL nranks=%d r=%d s=%d: idle slot\n",
                            nranks, _r, _s);
+                    out->exit_status = FASTEST_ERROR_ASSERT;
+                    goto fail;
+                }
+            }
+        }
+        fail:
+        free(partners); free(index); free(order);
+    }
+});
+
+// 7. Partners follow Eq. 5 exactly: q = r + rho(s) (r even), r - rho(s) (r odd), mod p,
+//    with rho(s) = sum_{k=0..s} (-2)^k. This is the locality property of Bine.
+FASTEST_CUSTOMTEST_INLINE("standalone/butterfly/partners_follow_eq5", FASTEST_FAIL_ERROR, NULL, {
+    out->exit_status = FASTEST_SUCCESS;
+    for (int nranks = 2; nranks <= (1<<BINE_MAX_STEPS); nranks *= 2) {
+        int steps = __builtin_ctz(nranks);
+        int *partners = (int*) malloc(nranks * steps * sizeof(int));
+        int *index    = (int*) malloc(nranks * sizeof(int));
+        int *order    = (int*) malloc(nranks * sizeof(int));
+        ncclGetBineButterflyDdbl(nranks, steps, partners, index, order);
+ 
+        long long rho = 0;  /* no top-level commas: the macro body is a macro argument */
+        long long pw = 1;
+        for (int _s = 0; _s < steps; _s++) {
+            rho += pw; pw *= -2;
+            long long m = ((rho % nranks) + nranks) % nranks;
+            for (int _r = 0; _r < nranks; _r++) {
+                int expect = (_r % 2 == 0) ? (int)((_r + m) % nranks)
+                                           : (int)((_r - m + nranks) % nranks);
+                int got = partners[idx(_r, _s, steps)];
+                if (got != expect) {
+                    printf("  [butterfly/partners_follow_eq5] FAIL nranks=%d r=%d s=%d: partner=%d expected %d\n",
+                           nranks, _r, _s, got, expect);
                     out->exit_status = FASTEST_ERROR_ASSERT;
                     goto fail;
                 }

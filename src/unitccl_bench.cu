@@ -244,11 +244,27 @@ static void check_correctness(CollType coll, size_t count,
     }
 
 done:
+    if(count <= 32 && (world_rank == 0 || coll == COLL_ALLGATHER || coll == COLL_REDUCESCATTER || coll == COLL_ALLREDUCE)) {
+        if(world_rank != 0)
+            MPI_Recv(NULL, 0, MPI_INT, world_rank - 1, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+        fprintf(stderr, "Rank %d got:\n", world_rank);
+        fprintf(stderr, "\t[");
+        for(int i = 0; i < (coll == COLL_ALLGATHER ? recv_count : count); i++) {
+            fprintf(stderr, "%.6g ", (double)h[i]);
+        }
+        fprintf(stderr, "]\n\n");
+
+        if(world_rank < world_size - 1)
+            MPI_Send(NULL, 0, MPI_INT, world_rank + 1, 0, MPI_COMM_WORLD);
+    }
+
     if (first_bad >= 0) {
         fprintf(stderr,
             "[rank %d] MISMATCH at index %d: got %.6g expected %.6g\n",
             world_rank, first_bad, (double)got_bad, (double)exp_bad);
         g_status = STATUS_ERROR_ASSERT;
+
     }
     free(h);
 }

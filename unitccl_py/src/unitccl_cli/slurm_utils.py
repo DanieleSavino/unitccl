@@ -130,7 +130,7 @@ def submit_rank_sweep(
 def submit_build(
     target: str,
     clean: bool = False,
-    timeout_min: int = 60,
+    timeout_min: int = 90,
     log_dir: str = "logs/build",
     gpus: int = 1,
 ) -> List:
