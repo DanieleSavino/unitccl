@@ -3,6 +3,7 @@
     unitccl standalone <preload> <submit> [--buffman SEND,DOUBLE_SEND]
     unitccl scaling --coll Bcast,AllReduce --algo BINE,RING --proto SIMPLE --plot --csv --check --warmup 10 --iters 40 --buffman SEND,BLOCK_BY_BLOCK
     unitccl scaling --coll Bcast --proto SIMPLE --csv --ranks 4,8,16,32,64,128
+    unitccl nccltests --coll AllGather --algo BINE,RING --proto SIMPLE --repeats 5 --plot --ranks 4,8,16,32,64,128
     unitccl nsys --outdir nsys --coll Bcast,Reduce --algo BINE,RING --proto SIMPLE --size 16777216 --nranks 8 --warmup 10 --iters 40 --check --buffman DOUBLE_SEND
     unitccl plot ranks --root . --collective Bcast,AllReduce --proto SIMPLE,LL [--size 4MB]
     unitccl plot size  --root . --collective Bcast --proto SIMPLE
@@ -10,6 +11,7 @@
     unitccl set partition <value>
     unitccl set qos <value>
     unitccl set nccl_lib </path/to/nccl/lib>
+    unitccl set nccltests_dir </path/to/nccl-tests>
     unitccl preload add <module> [<module> ...]
     unitccl preload rm  <module> [<module> ...]
 """
@@ -99,6 +101,49 @@ def cmd_scaling(args) -> None:
         fastest_iface.run_scaling(**scaling_kwargs)
 
 
+def cmd_nccltests(args) -> None:
+    import os
+    import shlex
+
+    from . import nccltests_utils
+
+    def _set(v):
+        return set(v.split(",")) if v else None
+
+    kwargs = dict(
+        colls=_set(args.coll),
+        algos=_set(args.algo),
+        protos=_set(args.proto),
+        do_plot=args.plot,
+        check=args.check,
+        warmup=args.warmup,
+        iters=args.iters,
+        repeats=args.repeats,
+        sizes=args.sizes.split(",") if args.sizes else None,
+        buffmans=_set(args.buffman),
+        avg_mode=args.avg,
+        inplace=args.inplace,
+        per_size=args.per_size,
+        timeout=args.timeout,
+        extra=shlex.split(args.extra or ""),
+        # resolved here so the (possibly remote) job gets an absolute path
+        bin_dir=str(nccltests_utils.resolve_bin_dir().resolve()),
+        strict=args.strict,
+    )
+
+    if args.ranks:
+        from . import slurm_utils
+
+        ranks_list = [int(r) for r in args.ranks.split(",")]
+        jobs = slurm_utils.submit_nccltests_sweep(
+            ranks_list, kwargs, outdir=args.outdir, timeout_min=args.time
+        )
+        slurm_utils.wait_for(jobs)
+    else:
+        nranks = args.nranks or int(os.environ.get("SLURM_NTASKS") or config.get("gpus_per_node", 4))
+        nccltests_utils.run_scaling(nranks=nranks, plot_dir=args.outdir, **kwargs)
+
+
 def cmd_nsys(args) -> None:
     from . import slurm_utils
 
@@ -130,7 +175,10 @@ def cmd_plot(args) -> None:
 
 
 def cmd_set(args) -> None:
-    key_map = {"account": "slurm_account", "partition": "slurm_partition", "qos": "slurm_qos", "nccl_lib": "nccl_lib"}
+    key_map = {
+        "account": "slurm_account", "partition": "slurm_partition", "qos": "slurm_qos",
+        "nccl_lib": "nccl_lib", "nccltests_dir": "nccltests_dir",
+    }
     cfg_key = key_map[args.what]
     config.set_value(cfg_key, args.value)
     ok(f"{args.what} set to '{args.value}' ({config.CONFIG_FILE})")
@@ -146,7 +194,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="command", required=True)
 
     sp = sub.add_parser("build", help="Build nccl / fastest / unitccl components.")
-    sp.add_argument("target", choices=["nccl", "fastest", "unitccl", "all"], help="Component to build.")
+    sp.add_argument("target", choices=["nccl", "fastest", "unitccl", "nccltests", "all"], help="Component to build.")
     sp.add_argument("--clean", action="store_true", help="Clean before building")
     sp.add_argument("--submit", action="store_true", help="Run in a Slurm job")
     sp.add_argument("--preload", action="store_true", help="Load configured modules first")
@@ -173,6 +221,35 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--buffman", help="Comma-separated buffer management modes")
     sp.set_defaults(func=cmd_scaling)
 
+    sp = sub.add_parser(
+        "nccltests",
+        help="Same sweep as `scaling`, but measured with nvidia nccl-tests; CSVs are plot-compatible.",
+    )
+    sp.add_argument("--coll", help="Comma-separated collectives (AllGather, AllReduce, Bcast, Reduce, ReduceScatter)")
+    sp.add_argument("--algo", help="Comma-separated algorithms (NCCL_ALGO)")
+    sp.add_argument("--proto", help="Comma-separated protocols (NCCL_PROTO)")
+    sp.add_argument("--sizes", help="Comma-separated PER-RANK sizes (default 1kB,16kB,256kB,1MB,4MB,64MB)")
+    sp.add_argument("--warmup", type=int, help="nccl-tests -w (default 10)")
+    sp.add_argument("--iters", type=int, help="nccl-tests -n, timed back-to-back (default 40)")
+    sp.add_argument("--repeats", type=int, default=1, help="nccl-tests -N: cycles per size = samples per CSV row")
+    sp.add_argument("--avg", choices=["max", "avg", "min", "rank0"], default="max",
+                    help="cross-rank reduction of the per-rank time (nccl-tests -a; default max = straggler)")
+    sp.add_argument("--inplace", action="store_true", help="record the in-place column instead of out-of-place")
+    sp.add_argument("--per-size", action="store_true",
+                    help="one nccl-tests process (fresh communicator) per size instead of one sweep")
+    sp.add_argument("--check", action="store_true", help="nccl-tests -c 1 (data verification)")
+    sp.add_argument("--buffman", help="Comma-separated buffer management modes (BINE only)")
+    sp.add_argument("--extra", help="extra nccl-tests arguments, e.g. '-z 1'")
+    sp.add_argument("--timeout", type=float, default=900.0, help="seconds per nccl-tests process before it is killed")
+    sp.add_argument("--strict", action="store_true", help="raise (job FAILED) if any size failed/timed out/was wrong")
+    sp.add_argument("--plot", action="store_true", help="Generate PNG plots next to each CSV")
+    sp.add_argument("--ranks", help="Comma-separated rank counts (triggers Slurm sweep)")
+    sp.add_argument("--nranks", type=int, help="local run only: rank count (default SLURM_NTASKS or gpus_per_node)")
+    sp.add_argument("--time", type=int, default=60, help="Slurm time limit per job, minutes")
+    sp.add_argument("--outdir", default="plots",
+                    help="root for <NNN>_ranks/<Coll>/ (default 'plots', same as `scaling`: reruns overwrite its CSVs)")
+    sp.set_defaults(func=cmd_nccltests)
+
     sp = sub.add_parser("nsys", help="Capture nsys profiles, generate stats, and analyze.")
     sp.add_argument("--outdir", type=Path, default=Path("nsys"), help="Output directory")
     sp.add_argument("--coll", help="Comma-separated collectives")
@@ -196,7 +273,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(func=cmd_plot)
 
     sp = sub.add_parser("set", help="Persist a Slurm default (account/partition/qos).")
-    sp.add_argument("what", choices=["account", "partition", "qos", "nccl_lib"])
+    sp.add_argument("what", choices=["account", "partition", "qos", "nccl_lib", "nccltests_dir"])
     sp.add_argument("value")
     sp.set_defaults(func=cmd_set)
 

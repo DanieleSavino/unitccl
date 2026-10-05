@@ -1,4 +1,5 @@
-"""Submitit-based Slurm helpers Submitit-based Slurm helpers.
+"""Submitit-based Slurm helpers.
+
 Each rank count in a sweep gets its own, independently-sized `sbatch`
 submission -- there is never one oversized allocation held for the whole
 sweep. This directly replaces hand-written per-rank-count sbatch scripts
@@ -13,6 +14,7 @@ from .logging_utils import info, ok
 
 import os
 import subprocess
+import sys
 
 try:
     import submitit
@@ -91,7 +93,7 @@ def _executor(job_name, nodes, tasks_per_node, gpus, timeout_min, log_dir):
 
 def _run_scaling_for_ranks(ranks: int, scaling_kwargs: dict):
     """Runs *inside* the submitted Slurm job: one rank count, writes csvs to
-    `<ranks>_ranks/<coll>/<coll>_<proto>.csv` (the layout `plotting.py`
+    `<ranks>_ranks/<coll>/<coll>_<proto>.csv` (the layout `plotting.py`'s
     loaders expect)."""
     from . import fastest_iface  # imported here: only needed inside the job
 
@@ -123,6 +125,50 @@ def submit_rank_sweep(
         job = executor.submit(_run_scaling_for_ranks, ranks, scaling_kwargs)
         jobs.append(job)
     ok(f"submitted {len(jobs)} jobs (one right-sized alloc per rank count)")
+    return jobs
+
+
+def _run_nccltests_for_ranks(ranks: int, outdir: str, nt_kwargs: dict):
+    """Runs *inside* the submitted Slurm job: one rank count, writes csvs to
+    `<outdir>/<ranks:03d>_ranks/<coll>/<coll>_<proto>.csv`, the same layout as
+    `_run_scaling_for_ranks`. Only task 0 works; it launches mpirun itself (same
+    pattern as the nsys jobs)."""
+    if int(os.environ.get("SLURM_PROCID", 0)) != 0:
+        return []
+    from . import nccltests_utils
+
+    kwargs = dict(nt_kwargs)
+    kwargs["nranks"] = ranks
+    kwargs["plot_dir"] = f"{outdir}/{ranks:03d}_ranks"
+    overrides = dict(kwargs.get("env_overrides") or {})
+    overrides[config.NRANKS_ENV] = str(ranks)
+    kwargs["env_overrides"] = overrides
+    written = nccltests_utils.run_scaling(**kwargs)
+    info(f"ranks={ranks}: job function done, {len(written)} csv(s) written, exiting")
+    sys.stdout.flush()
+    return written
+
+
+def submit_nccltests_sweep(
+    ranks_list: List[int],
+    nt_kwargs: dict,
+    outdir: str = "plots",
+    gpus_per_node: Optional[int] = None,
+    timeout_min: int = 60,
+    log_dir: str = "logs/nccltests",
+) -> List:
+    """One independently-sized submitit job per rank count, running nccl-tests."""
+    gpus_per_node = gpus_per_node or config.get("gpus_per_node", 4)
+    jobs = []
+    for ranks in ranks_list:
+        nodes = max(1, -(-ranks // gpus_per_node))
+        per_node = min(ranks, gpus_per_node)
+        executor = _executor(
+            f"unitccl-nccltests-{ranks}", nodes, per_node, per_node, timeout_min, log_dir
+        )
+        info(f"submitting nccl-tests ranks={ranks} nodes={nodes} gpus/node={per_node}")
+        jobs.append(executor.submit(_run_nccltests_for_ranks, ranks, outdir, nt_kwargs))
+    ok(f"submitted {len(jobs)} nccl-tests jobs (one right-sized alloc per rank count)")
     return jobs
 
 
@@ -160,26 +206,17 @@ def _run_nsys_job(outdir_str, colls, algos, sizes, nranks, proto, warmup, iters,
     job_env_overrides["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in range(gpus_per_node))
 
     base_outdir = Path(outdir_str)
-    active_buffmans = buffmans if buffmans else [""]
-
+    
+    # We pass buffmans down to nsys_utils.run_profiles so it plots all variations together
     for size in sizes:
-        for buffman in active_buffmans:
-            job_env_copy = dict(job_env_overrides)
-            if buffman:
-                job_env_copy[config.BINE_BUFFER_MANAGEMENT_ENV] = buffman
-                outdir = base_outdir / _human_size(size) / buffman
-            else:
-                outdir = base_outdir / _human_size(size)
-                if config.BINE_BUFFER_MANAGEMENT_ENV in job_env_copy:
-                    del job_env_copy[config.BINE_BUFFER_MANAGEMENT_ENV]
-                    
-            nsys_utils.run_profiles(
-                outdir, colls, algos,
-                size=size, nranks=nranks, proto=proto,
-                warmup=warmup, iters=iters, check=check, env_overrides=job_env_copy,
-            )
-            nsys_utils.generate_stats(outdir)
-            nsys_utils.analyze(outdir)
+        outdir = base_outdir / _human_size(size)
+        nsys_utils.run_profiles(
+            outdir, colls, algos,
+            size=size, nranks=nranks, proto=proto,
+            warmup=warmup, iters=iters, check=check, env_overrides=job_env_overrides, buffmans=buffmans
+        )
+        nsys_utils.generate_stats(outdir)
+        nsys_utils.analyze(outdir)
 
 
 def submit_nsys(

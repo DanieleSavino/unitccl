@@ -6,10 +6,13 @@ locally (venv already activated) or inside a submitted Slurm job.
 """
 from __future__ import annotations
 
+import os
+import shutil
 import subprocess
 from pathlib import Path
 from typing import Optional
 
+from . import config
 from .logging_utils import info, ok
 
 NVCC_GENCODE = "-gencode arch=compute_80,code=sm_80"
@@ -45,10 +48,43 @@ def build_unitccl(root: Path, clean: bool) -> None:
     _run("./scripts/build_wheel.sh", root)
 
 
+def _home_from_tool(env_var: str, tool: str) -> str:
+    """$ENV if set, else <prefix> of `<prefix>/bin/<tool>` found on PATH."""
+    if os.environ.get(env_var):
+        return os.environ[env_var]
+    exe = shutil.which(tool)
+    if not exe:
+        raise RuntimeError(f"cannot locate {env_var}: set it or put `{tool}` on PATH (module load ...)")
+    return str(Path(exe).resolve().parent.parent)
+
+
+def build_nccltests(root: Path, clean: bool) -> None:
+    """Build NVIDIA/nccl-tests (MPI=1) against the NCCL fork in <root>/nccl/build.
+    Not part of `build all`; run it after `build nccl`."""
+    nt_dir = config.nccltests_dir(root)
+    nccl_home = root / "nccl" / "build"
+    if not (nccl_home / "include" / "nccl.h").exists():
+        raise RuntimeError(f"{nccl_home} has no include/nccl.h -- run `unitccl build nccl` first")
+    if not nt_dir.exists():
+        nt_dir.parent.mkdir(parents=True, exist_ok=True)
+        # needs internet: do this once on a login node (compute nodes often have none)
+        _run(f"git clone --depth 1 https://github.com/NVIDIA/nccl-tests.git {nt_dir}", root)
+    if clean:
+        _run("make clean", nt_dir)
+    mpi_home = _home_from_tool("MPI_HOME", "mpicc")
+    cuda_home = _home_from_tool("CUDA_HOME", "nvcc")
+    _run(
+        f'make -j MPI=1 MPI_HOME={mpi_home} CUDA_HOME={cuda_home} NCCL_HOME={nccl_home} '
+        f'NVCC_GENCODE="{NVCC_GENCODE}"',
+        nt_dir,
+    )
+
+
 _BUILDERS = {
     "nccl": build_nccl,
     "fastest": build_fastest,
     "unitccl": build_unitccl,
+    "nccltests": build_nccltests,
 }
 
 _ORDER = ("nccl", "fastest", "unitccl")  # dependency order for target=all

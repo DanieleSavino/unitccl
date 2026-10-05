@@ -69,6 +69,10 @@ DEFAULT_PROTOS: Dict[str, bool] = {"SIMPLE": True, "LL": True, "LL128": True}
 DEFAULT_WARMUP = 10
 DEFAULT_ITERS = 40
 
+# Per-rank message sizes of the `scaling/1kB_64MB` pools (bytes of the
+# per-rank `count` handed to the collective, i.e. unitccl_bench's vec_size*4).
+DEFAULT_SIZES = ["1kB", "16kB", "256kB", "1MB", "4MB", "64MB"]
+
 # ── persisted config (~/.config/unitccl/config.json) ────────────────────────
 CONFIG_DIR = Path(os.environ.get("UNITCCL_CONFIG_DIR", Path.home() / ".config" / "unitccl"))
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -80,6 +84,9 @@ _DEFAULTS = {
     "slurm_qos": None,
     "gpus_per_node": 4,
     "preload_modules": [],
+    # Checkout of NVIDIA/nccl-tests (binaries live in <dir>/build). None ->
+    # <cwd>/vendor/nccl-tests. Env override: UNITCCL_NCCLTESTS_DIR.
+    "nccltests_dir": None,
 }
 
 
@@ -114,6 +121,12 @@ def set_value(key: str, value) -> dict:
 
 def get(key: str, default=None):
     return load().get(key, default)
+
+
+def nccltests_dir(root: Optional[Path] = None) -> Path:
+    """Where nccl-tests is (or will be) checked out."""
+    base = os.environ.get("UNITCCL_NCCLTESTS_DIR") or load().get("nccltests_dir")
+    return Path(base) if base else (root or Path.cwd()) / "vendor" / "nccl-tests"
 
 
 def active(d: Dict[str, bool], filter_set: Optional[Set[str]] = None) -> List[str]:

@@ -50,7 +50,9 @@ def _parse_test_column(test: str):
     """'scaling/1kB_64MB/RING_Bcast/1kB' -> (algo, size_str)."""
     parts = test.split("/")
     size_str = parts[-1]
-    algo = parts[-2].split("_")[0]
+    # "<algo-label>_<Coll>": collective names never contain "_", algo labels can
+    # (e.g. "BINE-BLOCK_BY_BLOCK_AllGather"), so split from the right.
+    algo = parts[-2].rsplit("_", 1)[0]
     return algo, size_str
 
 

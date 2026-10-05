@@ -9,23 +9,16 @@ from __future__ import annotations
 
 import importlib
 import os
+import pandas as pd
+from pathlib import Path
 from typing import Dict, List, Optional, Set
 
 import fastest
-from fastest.plotting import (
-    LegendLocation,
-    LineStyle,
-    MarkerStyle,
-    PlotMode,
-    Plotter,
-    PlotTransform,
-)
 
 from . import config
 from .logging_utils import color, section
 
 PLOT_DIR = "plots"
-PLOT_COLORS = ["#00d2ff", "#ff6b6b", "#a8ff78", "#f7971e", "#c471ed"]
 
 
 def load_backend():
@@ -54,7 +47,7 @@ def run_standalone(
     buffmans: Optional[List[str]] = None
 ) -> None:
     backend = load_backend()
-    active_buffmans = buffmans if (buffmans and len(buffmans) > 0) else [""]
+    active_buffmans = buffmans if (buffmans and len(buffmans) > 0) else [None]
     
     for buff in active_buffmans:
         curr_env = dict(env_overrides or {})
@@ -69,36 +62,6 @@ def run_standalone(
         apply_env(check=True, iters=None, warmup=None, overrides=curr_env)
         for test in backend.get_subtests("standalone"):
             fastest.run_log(test["test_name"])
-
-
-def _make_plotter(coll: str, proto: str, tick_labels) -> Plotter:
-    p = (
-        Plotter()
-        .set_title(f"{coll} scaling — {proto}")
-        .set_x_label("Message size")
-        .set_y_label("Latency")
-        .set_x_tick_labels(tick_labels)
-        .set_bg_color("#1a1a2e")
-        .set_title_color("#e0e0e0")
-        .set_label_color("#cccccc")
-        .set_tick_color("#aaaaaa")
-        .set_line_width(2.5)
-        .set_marker(MarkerStyle.DIAMOND, size=10)
-        .set_legend(LegendLocation.UPPER_LEFT, fontsize=11)
-        .set_grid(True, color="#333355", style=LineStyle.DOTTED, alpha=0.5)
-        .show_info(False)
-        .set_dpi(200)
-    )
-    for i, c in enumerate(PLOT_COLORS):
-        p.set_pool_color(i, c)
-    return p
-
-
-def _make_diff_plotter(coll: str, proto: str, baseline_algo: str, tick_labels) -> Plotter:
-    p = _make_plotter(coll, proto, tick_labels)
-    p.set_title(f"{coll} scaling — {proto}  (Δ vs {baseline_algo})")
-    p.set_y_label(f"Δ vs {baseline_algo}")
-    return p
 
 
 def run_scaling(
@@ -127,13 +90,12 @@ def run_scaling(
         return []
 
     load_backend()
-    tick_labels = tick_labels or ["1kB", "16kB", "256kB", "1MB", "4MB", "64MB"]
     written: List[str] = []
 
     section("scaling comparison")
     active_colls = config.active(config.DEFAULT_COLLS, colls)
     active_protos = config.active(config.DEFAULT_PROTOS, protos)
-    active_buffmans = sorted(list(buffmans)) if buffmans else [""]
+    active_buffmans = sorted(list(buffmans)) if buffmans else [None]
 
     for coll in active_colls:
         coll_algos = config.active(config.DEFAULT_ALGOS.get(coll, {}), algos)
@@ -141,48 +103,65 @@ def run_scaling(
             print(color(f"   [skip] {coll}: no active algos", "dim"))
             continue
 
-        pools = {a: fastest.pool_from_prefix(f"scaling/1kB_64MB/{a}_{coll}") for a in coll_algos}
+        file_dir = f"{plot_dir}/{coll}"
+        if do_csv or do_plot:
+            os.makedirs(file_dir, exist_ok=True)
+            
         baseline_algo = coll_algos[0]
 
         for proto in active_protos:
-            for buffman in active_buffmans:
-                curr_env = dict(env_overrides or {})
-                if buffman:
-                    curr_env[config.BINE_BUFFER_MANAGEMENT_ENV] = buffman
-                    effective_proto = f"{proto}_{buffman}"
-                    label_proto = f"{proto} ({buffman})"
-                else:
-                    if config.BINE_BUFFER_MANAGEMENT_ENV in os.environ:
-                        del os.environ[config.BINE_BUFFER_MANAGEMENT_ENV]
-                    effective_proto = proto
-                    label_proto = proto
+            os.environ["NCCL_PROTO"] = proto
+            proto_dfs = []
+
+            for algo in coll_algos:
+                buffs = active_buffmans if algo == "BINE" else [None]
                 
-                os.environ["NCCL_PROTO"] = proto
-                apply_env(check, iters, warmup, curr_env)
+                for buffman in buffs:
+                    curr_env = dict(env_overrides or {})
+                    if buffman:
+                        curr_env[config.BINE_BUFFER_MANAGEMENT_ENV] = buffman
+                        algo_label = f"{algo}-{buffman}"
+                    else:
+                        algo_label = algo
+                        if config.BINE_BUFFER_MANAGEMENT_ENV in os.environ:
+                            del os.environ[config.BINE_BUFFER_MANAGEMENT_ENV]
 
-                print(color(f"\n  {coll}  proto={label_proto}  algos={coll_algos}", "blue"))
+                    apply_env(check, iters, warmup, curr_env)
+                    print(color(f"\n  {coll}  proto={proto}  algo={algo_label}", "blue"))
 
-                cmp = fastest.compare(*pools.values(), n_repeats=n_repeats)
-                cmp.report()
+                    pool = fastest.pool_from_prefix(f"scaling/1kB_64MB/{algo}_{coll}")
+                    cmp = fastest.compare(pool, n_repeats=n_repeats)
+                    cmp.report()
 
-                file_dir = f"{plot_dir}/{coll}"
-                if do_csv:
-                    os.makedirs(file_dir, exist_ok=True)
-                    csv_path = f"{file_dir}/{coll}_{effective_proto}.csv"
-                    cmp.save_csv(csv_path)
+                    tmp_csv = f"{file_dir}/.tmp_{proto}_{algo_label}.csv"
+                    cmp.save_csv(tmp_csv)
+                    df = pd.read_csv(tmp_csv)
+                    df['test'] = df['test'].str.replace(f"/{algo}_{coll}/", f"/{algo_label}_{coll}/")
+                    proto_dfs.append(df)
+                    os.remove(tmp_csv)
+
+            if proto_dfs:
+                final_df = pd.concat(proto_dfs, ignore_index=True)
+                csv_path = f"{file_dir}/{coll}_{proto}.csv"
+                
+                if do_csv or do_plot:
+                    final_df.to_csv(csv_path, index=False)
                     written.append(csv_path)
-                    print(color(f"   saved → {csv_path}", "dim"))
+                    if do_csv:
+                        print(color(f"   saved → {csv_path}", "dim"))
 
                 if do_plot:
-                    os.makedirs(file_dir, exist_ok=True)
-                    png_path = f"{file_dir}/{coll}_{effective_proto}.png"
-                    _make_plotter(coll, label_proto, tick_labels).plot(cmp, png_path, PlotMode.MEDIAN)
+                    from .schema import load_fastest_csv, records_to_df
+                    from .plotting import plot_size, plot_diff
+                    recs = load_fastest_csv(Path(csv_path), coll, proto, ranks=None)
+                    plot_df = records_to_df(recs)
+                    
+                    png_path = f"{file_dir}/{coll}_{proto}.png"
+                    plot_size(plot_df, coll, proto, Path(png_path))
                     print(color(f"   saved → {png_path}", "dim"))
-
-                    diff_path = f"{file_dir}/{coll}_{effective_proto}_diff.png"
-                    _make_diff_plotter(coll, label_proto, baseline_algo, tick_labels).plot(
-                        cmp, diff_path, PlotMode.MEDIAN, PlotTransform.DIFF
-                    )
+                    
+                    diff_path = f"{file_dir}/{coll}_{proto}_diff.png"
+                    plot_diff(plot_df, coll, proto, Path(diff_path), baseline_algo=baseline_algo)
                     print(color(f"   saved → {diff_path}", "dim"))
 
-    return written   return written
+    return written

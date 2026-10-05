@@ -59,6 +59,7 @@ src/unitccl_cli/
 ├── fastest_iface.py    # wraps `fastest` + dynamic backend import;
 │                       # standalone tests + scaling comparisons/plots
 ├── logging_utils.py    # shared ANSI logging helpers ([info]/[ok]/[error])
+├── nccltests_utils.py  # nccl-tests backend: same sweep matrix as `scaling`, plot-compatible CSVs
 ├── nsys_utils.py       # nsys profile capture, `nsys stats` CSV export,
 │                       # and BINE-vs-RING analysis plots
 ├── plotting.py         # rank-sweep plots (time vs size, time vs ranks)
@@ -93,6 +94,14 @@ unitccl scaling --coll Bcast,AllReduce --algo BINE,RING --proto SIMPLE --plot --
 # blocks until every job finishes.
 unitccl scaling --coll Bcast --proto SIMPLE --csv --ranks 4,8,16,32,64,128
 
+# Same matrix measured with nccl-tests instead of fastest/unitccl_bench. Writes
+# plots/<NNN>_ranks/<Coll>/<Coll>_<PROTO>.csv in the exact scaling schema, so
+# `unitccl plot ...` and the Δ-vs-baseline plots just work. --repeats R = R
+# nccl-tests cycles (-N) = R samples per row (mean/stddev/min/max/median).
+unitccl nccltests --coll AllGather --algo BINE,RING --proto SIMPLE --repeats 5 --plot --ranks 4,8,16,32,64,128
+unitccl nccltests --coll AllGather --buffman SEND,BLOCK_BY_BLOCK --nranks 8 --outdir plots/008_ranks   # local, inside an allocation
+unitccl nccltests --coll AllGather --sizes 1kB,64kB,1MB,16MB --ranks 8,16   # custom per-rank sizes
+
 # Capture nsys profiles for BINE vs RING, export nsys-stats CSVs, and
 # generate the bine-vs-ring comparison plots -- all in one call.
 unitccl nsys --outdir nsys_out --coll Bcast,Reduce --algo BINE,RING --proto SIMPLE --size 16777216 --nranks 8 --warmup 10 --iters 40 --check --buffman SEND,DOUBLE_SEND
@@ -126,6 +135,90 @@ module settings for each HPC system this has been run on. Nothing loads
 these automatically; copy the relevant fields into your own
 `~/.config/unitccl/config.json` (or run the `unitccl set`/`preload add`
 commands above with those values) when switching clusters.
+
+## nccl-tests backend
+
+`unitccl nccltests` runs `all_gather_perf` / `all_reduce_perf` / `broadcast_perf` /
+`reduce_perf` / `reduce_scatter_perf` (AllGatherV has no nccl-tests binary and is
+skipped) under `mpirun`, one rank per GPU, with the same `NCCL_ALGO` /
+`NCCL_PROTO` / `NCCL_BINE_BUFFER_MANAGEMENT` matrix as `scaling`. Rank sweeps use
+one right-sized Slurm job per rank count and launch `mpirun` from task 0, the same
+pattern as the nsys jobs.
+
+Build it once with `unitccl build nccl && unitccl build nccltests` (needs `mpicc`
+and `nvcc` on PATH, or `MPI_HOME` / `CUDA_HOME` set; the clone needs internet, so
+do it on a login node). To use an existing checkout instead:
+`unitccl set nccltests_dir /path/to/nccl-tests` or `UNITCCL_NCCLTESTS_DIR`.
+
+### Options
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--coll` | all | Comma-separated: AllGather, AllReduce, Bcast, Reduce, ReduceScatter |
+| `--algo` | per-collective defaults | `NCCL_ALGO` values; the first one is the baseline of the `_diff` plot |
+| `--proto` | SIMPLE,LL,LL128 | `NCCL_PROTO` values |
+| `--buffman` | none | BINE buffer management modes, e.g. `SEND,BLOCK_BY_BLOCK`; BINE rows are labelled `BINE-<mode>` |
+| `--sizes` | `1kB,16kB,256kB,1MB,4MB,64MB` | **Per-rank** message sizes, see below |
+| `--warmup` | 10 | nccl-tests `-w` |
+| `--iters` | 40 | nccl-tests `-n`, timed back to back |
+| `--repeats` | 1 | nccl-tests `-N`: cycles per size; each cycle average is one sample in the CSV |
+| `--avg` | `max` | Cross-rank reduction (nccl-tests `-a`): `max`, `avg`, `min`, `rank0` |
+| `--inplace` | off | Record the in-place column instead of out-of-place |
+| `--per-size` | off | One nccl-tests process (fresh communicator) per size instead of one sweep |
+| `--check` | off | nccl-tests `-c 1`; wrong values are reported as failures |
+| `--extra` | none | Extra nccl-tests arguments, e.g. `--extra '-z 1'` |
+| `--timeout` | 900 | Seconds per nccl-tests process before it is killed |
+| `--strict` | off | Raise (Slurm job FAILED) if any size failed, timed out or was wrong |
+| `--plot` | off | Write `<Coll>_<PROTO>.png` and `_diff.png` next to each CSV |
+| `--ranks` | none | Comma-separated rank counts: submit one Slurm job per count |
+| `--nranks` | `SLURM_NTASKS` or `gpus_per_node` | Local runs only (no `--ranks`) |
+| `--time` | 60 | Slurm time limit per job, in minutes |
+| `--outdir` | `plots` | Root for `<NNN>_ranks/<Coll>/` (local runs: written to `<outdir>/<Coll>/`) |
+
+### Choosing message sizes (`--sizes`)
+
+`--sizes` takes a comma-separated list such as `--sizes 1kB,64kB,1MB,16MB`.
+
+- Sizes are **per rank**: the byte count of the `count` argument given to the
+  collective, the same as the `1kB ... 64MB` labels in `scaling` and `unitccl_bench`'s
+  `vec_size * 4`. For AllGather the gathered buffer is `size * ranks`, for
+  ReduceScatter the input is. You do not convert anything: nccl-tests' `-b/-e`
+  are totals for those two, so the tool multiplies by the rank count itself.
+- Accepted units are `B`, `kB`, `MB`, `GB` (case-insensitive, powers of 1024),
+  e.g. `4096B`, `256kB`, `1.5MB`. Every size must be a multiple of 4 bytes
+  (floats). Duplicates are dropped and the list is sorted.
+- If **all** sizes are powers of two (the default set is), they run as a single
+  `-b <min> -e <max> -f 2` sweep in one communicator. The intermediate sizes the
+  sweep also visits (2kB, 4kB, ...) are discarded, not written to the CSV.
+- If any size is not a power of two (e.g. `1.5MB`, `3000B`), or you pass
+  `--per-size`, each size runs in its own nccl-tests process with `-b = -e`. That
+  costs one communicator init per size and every size gets a fresh communicator.
+- Labels in the CSV are normalised (`1048576B` becomes `1MB`), and the pool name
+  uses the smallest and largest size (`scaling/<min>_<max>/<Algo>_<Coll>`). A custom
+  `--sizes` therefore produces CSVs that `unitccl plot` reads like any other.
+- Mixing runs with different `--sizes` under one `<NNN>_ranks/` directory is fine
+  for `plot size`, but `plot ranks` draws one panel per size found, so sizes
+  missing at some rank counts give panels with fewer points.
+- The exact range nccl-tests accepts is limited by GPU memory: for AllGather the
+  receive buffer is `max size * ranks` per GPU.
+
+### Semantics vs `unitccl_bench`
+
+- **Timing** is `-n` iterations back to back with no per-iteration barrier. One `-N`
+  cycle average is one sample; `mean_ns`, `stddev_ns`, `min_ns`, `max_ns`,
+  `median_ns` and `samples_ns` are computed over those samples (a single repeat
+  gives `stddev_ns = 0`, like the existing CSVs). `-N` needs a reasonably recent
+  nccl-tests.
+- `--avg max` reports the slowest rank's average, which is the closest analogue of
+  the straggler metric but not identical to a per-iteration max.
+- nccl-tests always runs out-of-place and in-place; only one column is recorded.
+- A size that times out, crashes, or reports wrong values is listed at the end and
+  left out of the CSV (not zero-filled, so log-scale plots keep working).
+- Output defaults to the same `plots/` root as `scaling`, so it overwrites those
+  CSVs (a warning is printed). Use `--outdir plots_nt` and
+  `unitccl plot ranks --root plots_nt` to keep both.
+- The first run prints which `libnccl` the binary resolves, and `NCCL_DEBUG=VERSION`
+  prints the NCCL version, to confirm the fork is the one being measured.
 
 ## Live job dashboard
 
@@ -187,4 +280,4 @@ plots/
 
 `<N>_ranks/<Coll>/<Coll>_<PROTO>.csv` is what the submitit sweep jobs write
 directly; `plotting.py` reads those csvs back for both `plot ranks` and
-`plot size`, and `nsys_utils.py` owns the `nsys/`-shaped subtree above.s_utils.py` owns the `nsys/`-shaped subtree above.
+`plot size`, and `nsys_utils.py` owns the `nsys/`-shaped subtree above.
