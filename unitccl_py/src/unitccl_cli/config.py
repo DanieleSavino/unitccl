@@ -20,6 +20,7 @@ ITERS_ENV = "UNITCCL_ITERS"
 WARMUP_ENV = "UNITCCL_WARMUP"
 NRANKS_ENV = "UNITCCL_NRANKS"  # informational tag set during rank sweeps
 PLACEHOLDER = "UNITCCL_PLACEHOLDER"
+BINE_BUFFER_MANAGEMENT_ENV = "NCCL_BINE_BUFFER_MANAGEMENT"
 
 # ── default registries (mirrors the current tests.py) ───────────────────────
 DEFAULT_COLLS: Dict[str, bool] = {
@@ -68,6 +69,10 @@ DEFAULT_PROTOS: Dict[str, bool] = {"SIMPLE": True, "LL": True, "LL128": True}
 DEFAULT_WARMUP = 10
 DEFAULT_ITERS = 40
 
+# Per-rank message sizes of the `scaling/1kB_64MB` pools (bytes of the
+# per-rank `count` handed to the collective, i.e. unitccl_bench's vec_size*4).
+DEFAULT_SIZES = ["1kB", "16kB", "256kB", "1MB", "4MB", "64MB"]
+
 # ── persisted config (~/.config/unitccl/config.json) ────────────────────────
 CONFIG_DIR = Path(os.environ.get("UNITCCL_CONFIG_DIR", Path.home() / ".config" / "unitccl"))
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -78,7 +83,14 @@ _DEFAULTS = {
     "slurm_partition": None,
     "slurm_qos": None,
     "gpus_per_node": 4,
+    # CPUs Slurm reserves per task (one task = one GPU rank). None -> Slurm's
+    # default (usually 1). Rule of thumb: node cores / gpus_per_node
+    # (Leonardo Booster: 32 / 4 = 8). Set with `unitccl set cpus_per_task 8`.
+    "cpus_per_task": None,
     "preload_modules": [],
+    # Checkout of NVIDIA/nccl-tests (binaries live in <dir>/build). None ->
+    # <cwd>/vendor/nccl-tests. Env override: UNITCCL_NCCLTESTS_DIR.
+    "nccltests_dir": None,
 }
 
 
@@ -115,9 +127,16 @@ def get(key: str, default=None):
     return load().get(key, default)
 
 
+def nccltests_dir(root: Optional[Path] = None) -> Path:
+    """Where nccl-tests is (or will be) checked out."""
+    base = os.environ.get("UNITCCL_NCCLTESTS_DIR") or load().get("nccltests_dir")
+    return Path(base) if base else (root or Path.cwd()) / "vendor" / "nccl-tests"
+
+
 def active(d: Dict[str, bool], filter_set: Optional[Set[str]] = None) -> List[str]:
     """Names whose flag is True, optionally restricted to `filter_set`."""
     return [k for k, v in d.items() if v and (filter_set is None or k in filter_set)]
+
 
 def add_preload_module(module: str) -> dict:
     """Append a module to the preload list, preserving insertion order, no dupes."""

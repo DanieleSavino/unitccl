@@ -43,8 +43,9 @@ REPORTS = [
 # each other (poll/epoll on sockets, semaphores for CUDA IPC handshakes).
 NETWORK_WAIT_CALLS = {"poll", "epoll_wait", "sem_wait", "sem_timedwait"}
 
+# Modified to capture algorithm names with hyphens (e.g. bine-send)
 FNAME_RE = re.compile(
-    r"^(?P<collective>[A-Za-z0-9]+)_(?P<algo>bine|ring)_nsys_rank(?P<rank>\d+)_(?P<report>.+)\.csv$"
+    r"^(?P<collective>[A-Za-z0-9]+)_(?P<algo>[A-Za-z0-9-_]+)_nsys_rank(?P<rank>\d+)_(?P<report>.+)\.csv$"
 )
 
 
@@ -63,6 +64,7 @@ def run_profiles(
     iters: Optional[int] = None,
     check: bool = False,
     env_overrides: Optional[Dict[str, str]] = None,
+    buffmans: Optional[List[str]] = None,
 ) -> None:
     if shutil.which("nsys") is None:
         raise RuntimeError("'nsys' not found on PATH. Load/activate your Nsight Systems install first.")
@@ -76,26 +78,40 @@ def run_profiles(
         env[config.ITERS_ENV] = str(iters)
     env.update(env_overrides or {})
     full_env = {**os.environ, **env}
+    
+    active_buffmans = buffmans if buffmans else [None]
 
     for coll in colls:
         for algo in algos:
-            name = f"{coll.lower()}_{algo.lower()}_nsys"
-            info(f"profiling {coll} with {algo}")
-            full_env["NCCL_ALGO"] = algo
-            cmd = [
-                "mpirun",
-                "-n",
-                str(nranks),
-                "nsys",
-                "profile",
-                *NSYS_FLAGS,
-                "-o",
-                str(outdir / f"{name}_rank%q{{OMPI_COMM_WORLD_RANK}}"),
-                bench_bin,
-                coll,
-                str(size),
-            ]
-            subprocess.run(cmd, env=full_env, check=True)
+            buffs = active_buffmans if algo == "BINE" else [None]
+            for buffman in buffs:
+                run_env = full_env.copy()
+                run_env["NCCL_ALGO"] = algo
+                if buffman:
+                    run_env[config.BINE_BUFFER_MANAGEMENT_ENV] = buffman
+                    algo_label = f"{algo.lower()}-{buffman.lower()}"
+                else:
+                    algo_label = algo.lower()
+                    if config.BINE_BUFFER_MANAGEMENT_ENV in run_env:
+                        del run_env[config.BINE_BUFFER_MANAGEMENT_ENV]
+                        
+                name = f"{coll.lower()}_{algo_label}_nsys"
+                info(f"profiling {coll} with {algo_label.upper()}")
+                
+                cmd = [
+                    "mpirun",
+                    "-n",
+                    str(nranks),
+                    "nsys",
+                    "profile",
+                    *NSYS_FLAGS,
+                    "-o",
+                    str(outdir / f"{name}_rank%q{{OMPI_COMM_WORLD_RANK}}"),
+                    bench_bin,
+                    coll,
+                    str(size),
+                ]
+                subprocess.run(cmd, env=run_env, check=True)
     ok(f"profiles written to {outdir}")
 
 
@@ -186,8 +202,6 @@ def _safe_read_csv(path: Path) -> Optional[pd.DataFrame]:
 
 
 def _extract_metrics(files_by_report: Dict[str, Path]) -> dict:
-    """Given the set of report CSVs for one (collective, algo, rank), pull out
-    the metrics we care about. All *_ns fields are nanoseconds."""
     metrics = {
         "nccl_init_ns": None,
         "nccl_op_ns": None,
@@ -200,7 +214,6 @@ def _extract_metrics(files_by_report: Dict[str, Path]) -> dict:
         "cuda_api_total_ns": None,
     }
 
-    # --- nvtx_sum: NCCL:ncclCommInitRank (init time) + NCCL:nccl<Collective> (op time)
     if "nvtx_sum" in files_by_report:
         df = _safe_read_csv(files_by_report["nvtx_sum"])
         if df is not None and "Range" in df.columns:
@@ -212,7 +225,6 @@ def _extract_metrics(files_by_report: Dict[str, Path]) -> dict:
                 elif rng.startswith("NCCL:") and rng != "NCCL:ncclCommInitRank":
                     metrics["nccl_op_ns"] = metric_val
 
-    # --- cuda_gpu_kern_sum: actual GPU compute kernel time
     if "cuda_gpu_kern_sum" in files_by_report:
         df = _safe_read_csv(files_by_report["cuda_gpu_kern_sum"])
         if df is not None and len(df):
@@ -222,7 +234,6 @@ def _extract_metrics(files_by_report: Dict[str, Path]) -> dict:
             if "Name" in df.columns and "Total Time (ns)" in df.columns:
                 metrics["gpu_kernel_name"] = df.loc[df["Total Time (ns)"].idxmax(), "Name"]
 
-    # --- cuda_gpu_mem_time_sum: memcpy / memset time on the GPU
     if "cuda_gpu_mem_time_sum" in files_by_report:
         df = _safe_read_csv(files_by_report["cuda_gpu_mem_time_sum"])
         if df is not None and "Operation" in df.columns:
@@ -233,7 +244,6 @@ def _extract_metrics(files_by_report: Dict[str, Path]) -> dict:
                 metrics["gpu_memcpy_ns"] = df.loc[memcpy_mask, val_col].median()
                 metrics["gpu_memset_ns"] = df.loc[memset_mask, val_col].median()
 
-    # --- cuda_gpu_mem_size_sum: bytes moved per operation instance
     if "cuda_gpu_mem_size_sum" in files_by_report:
         df = _safe_read_csv(files_by_report["cuda_gpu_mem_size_sum"])
         if df is not None and len(df):
@@ -243,7 +253,6 @@ def _extract_metrics(files_by_report: Dict[str, Path]) -> dict:
             if size_col in df.columns:
                 metrics["gpu_mem_bytes"] = df[size_col].median() * 1024 * 1024
 
-    # --- osrt_sum: proxy thread network waiting (poll/epoll/sem_wait)
     if "osrt_sum" in files_by_report:
         df = _safe_read_csv(files_by_report["osrt_sum"])
         if df is not None and "Name" in df.columns:
@@ -252,7 +261,6 @@ def _extract_metrics(files_by_report: Dict[str, Path]) -> dict:
                 mask = df["Name"].isin(NETWORK_WAIT_CALLS)
                 metrics["network_wait_ns"] = df.loc[mask, val_col].median() if mask.any() else 0.0
 
-    # --- cuda_api_sum: total CUDA driver/runtime API time (setup overhead)
     if "cuda_api_sum" in files_by_report:
         df = _safe_read_csv(files_by_report["cuda_api_sum"])
         if df is not None and len(df):
@@ -316,8 +324,6 @@ def make_summary(df: pd.DataFrame) -> pd.DataFrame:
 def plot_metric_comparison(
     df: pd.DataFrame, metric_ns_col: str, ylabel: str, title: str, out_path: Path
 ) -> None:
-    """Grouped bar chart: x = collective, bars = algo (ring/bine), value =
-    median(metric) in ms, error bars = std across ranks (clipped at 0)."""
     d = df.copy()
     d[metric_ns_col] = d[metric_ns_col].apply(_ns_to_ms)
     d = d.dropna(subset=[metric_ns_col])
@@ -328,11 +334,9 @@ def plot_metric_comparison(
     stats = d.groupby(["collective", "algo"])[metric_ns_col].agg(["median", "std"]).reset_index()
     collectives = sorted(stats["collective"].unique())
 
-    algos = ["ring", "bine"]
-    algos = [a for a in algos if a in stats["algo"].unique()] or sorted(stats["algo"].unique())
-
+    algos = sorted(stats["algo"].unique())
     x = range(len(collectives))
-    width = 0.8 / len(algos)
+    width = 0.8 / max(1, len(algos))
 
     fig, ax = plt.subplots(figsize=(7, 5))
     for i, algo in enumerate(algos):
@@ -372,8 +376,7 @@ def plot_per_rank(
     if d.empty:
         return
 
-    target_order = ["ring", "bine"]
-    available_algos = [a for a in target_order if a in d["algo"].unique()]
+    available_algos = sorted(d["algo"].unique())
 
     fig, ax = plt.subplots(figsize=(7, 5))
     for algo in available_algos:
