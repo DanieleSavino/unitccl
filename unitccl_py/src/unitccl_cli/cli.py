@@ -7,6 +7,7 @@
     unitccl nsys --outdir nsys --coll Bcast,Reduce --algo BINE,RING --proto SIMPLE --size 16777216 --nranks 8 --warmup 10 --iters 40 --check --buffman DOUBLE_SEND
     unitccl plot ranks --root . --collective Bcast,AllReduce --proto SIMPLE,LL [--size 4MB]
     unitccl plot size  --root . --collective Bcast --proto SIMPLE
+    unitccl plot heatmap --root . --collective AllReduce --proto SIMPLE
     unitccl set account <value>
     unitccl set partition <value>
     unitccl set qos <value>
@@ -263,8 +264,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--buffman", help="Comma-separated buffer management modes")
     sp.set_defaults(func=cmd_nsys)
 
-    sp = sub.add_parser("plot", help="Plot rank-sweep data (time vs size, or time vs ranks).")
-    sp.add_argument("mode", choices=["ranks", "size"])
+    sp = sub.add_parser("plot", help="Plot rank-sweep data (time vs size, time vs ranks, or best-algo heatmap).")
+    sp.add_argument("mode", choices=["ranks", "size", "heatmap"])
     sp.add_argument("--root", default=".", help="Root dir containing <N>_ranks folders")
     sp.add_argument("--collective", "--coll", dest="collective", required=True, help="Comma-separated collectives")
     sp.add_argument("--proto", default=None, help="Comma-separated protocols (default: autodetect)")

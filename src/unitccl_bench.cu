@@ -451,7 +451,7 @@ int main(int argc, char **argv) {
 
     /* ── cleanup ──────────────────────────────────────────────────────── */
 
-    // NCCL_CHECK(ncclCommDestroy(comm));
+    //NCCL_CHECK(ncclCommDestroy(comm));
     CUDA_CHECK(cudaFree(d_send));
     CUDA_CHECK(cudaFree(d_recv));
     CUDA_CHECK(cudaStreamDestroy(stream));
