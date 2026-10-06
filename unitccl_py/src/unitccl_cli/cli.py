@@ -1,7 +1,7 @@
 """unitccl command-line entrypoint.
 
     unitccl standalone <preload> <submit> [--buffman SEND,DOUBLE_SEND]
-    unitccl scaling --coll Bcast,AllReduce --algo BINE,RING --proto SIMPLE --plot --csv --check --warmup 10 --iters 40 --buffman SEND,BLOCK_BY_BLOCK
+    unitccl scaling --coll Bcast,AllReduce --algo BINE,RING --proto SIMPLE --plot --csv --check --warmup 10 --iters 40 --repeats 3 --buffman SEND,BLOCK_BY_BLOCK
     unitccl scaling --coll Bcast --proto SIMPLE --csv --ranks 4,8,16,32,64,128
     unitccl nccltests --coll AllGather --algo BINE,RING --proto SIMPLE --repeats 5 --plot --ranks 4,8,16,32,64,128
     unitccl nsys --outdir nsys --coll Bcast,Reduce --algo BINE,RING --proto SIMPLE --size 16777216 --nranks 8 --warmup 10 --iters 40 --check --buffman DOUBLE_SEND
@@ -13,6 +13,7 @@
     unitccl set qos <value>
     unitccl set nccl_lib </path/to/nccl/lib>
     unitccl set nccltests_dir </path/to/nccl-tests>
+    unitccl set cpus_per_task <n>
     unitccl preload add <module> [<module> ...]
     unitccl preload rm  <module> [<module> ...]
 """
@@ -91,6 +92,7 @@ def cmd_scaling(args) -> None:
         check=args.check,
         warmup=args.warmup,
         iters=args.iters,
+        n_repeats=args.repeats,
         buffmans=set(args.buffman.split(",")) if args.buffman else None,
     )
 
@@ -175,14 +177,32 @@ def cmd_plot(args) -> None:
     plotting.run_plot_command(args.mode, root, collectives, protos, outdir, size_filter=args.size)
 
 
+# `unitccl set <what>` -> key in config.json
+_SET_KEYS = {
+    "account": "slurm_account",
+    "partition": "slurm_partition",
+    "qos": "slurm_qos",
+    "nccl_lib": "nccl_lib",
+    "nccltests_dir": "nccltests_dir",
+    "cpus_per_task": "cpus_per_task",
+}
+
+# keys stored as integers rather than strings
+_SET_INT_KEYS = {"cpus_per_task"}
+
+
 def cmd_set(args) -> None:
-    key_map = {
-        "account": "slurm_account", "partition": "slurm_partition", "qos": "slurm_qos",
-        "nccl_lib": "nccl_lib", "nccltests_dir": "nccltests_dir",
-    }
-    cfg_key = key_map[args.what]
-    config.set_value(cfg_key, args.value)
-    ok(f"{args.what} set to '{args.value}' ({config.CONFIG_FILE})")
+    cfg_key = _SET_KEYS[args.what]
+    value = args.value
+    if args.what in _SET_INT_KEYS:
+        try:
+            value = int(value)
+        except ValueError:
+            raise ValueError(f"{args.what} must be an integer, got '{args.value}'")
+        if value < 1:
+            raise ValueError(f"{args.what} must be >= 1, got {value}")
+    config.set_value(cfg_key, value)
+    ok(f"{args.what} set to '{value}' ({config.CONFIG_FILE})")
 
 
 # ── argparse wiring ──────────────────────────────────────────────────────────
@@ -218,6 +238,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--check", action="store_true", help="Enable correctness verification")
     sp.add_argument("--warmup", type=int, help="Number of warmup iterations")
     sp.add_argument("--iters", type=int, help="Number of measured iterations")
+    sp.add_argument("--repeats", type=int, default=1,
+                    help="fastest compare n_repeats: independent launches (samples) per CSV row")
     sp.add_argument("--ranks", help="Comma-separated rank counts (triggers Slurm sweep)")
     sp.add_argument("--buffman", help="Comma-separated buffer management modes")
     sp.set_defaults(func=cmd_scaling)
@@ -273,8 +295,11 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--outdir", default="plots", help="Output directory for PNGs")
     sp.set_defaults(func=cmd_plot)
 
-    sp = sub.add_parser("set", help="Persist a Slurm default (account/partition/qos).")
-    sp.add_argument("what", choices=["account", "partition", "qos", "nccl_lib", "nccltests_dir"])
+    sp = sub.add_parser(
+        "set",
+        help="Persist a default (account/partition/qos/nccl_lib/nccltests_dir/cpus_per_task).",
+    )
+    sp.add_argument("what", choices=list(_SET_KEYS))
     sp.add_argument("value")
     sp.set_defaults(func=cmd_set)
 

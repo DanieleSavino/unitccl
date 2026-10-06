@@ -83,6 +83,10 @@ _DEFAULTS = {
     "slurm_partition": None,
     "slurm_qos": None,
     "gpus_per_node": 4,
+    # CPUs Slurm reserves per task (one task = one GPU rank). None -> Slurm's
+    # default (usually 1). Rule of thumb: node cores / gpus_per_node
+    # (Leonardo Booster: 32 / 4 = 8). Set with `unitccl set cpus_per_task 8`.
+    "cpus_per_task": None,
     "preload_modules": [],
     # Checkout of NVIDIA/nccl-tests (binaries live in <dir>/build). None ->
     # <cwd>/vendor/nccl-tests. Env override: UNITCCL_NCCLTESTS_DIR.

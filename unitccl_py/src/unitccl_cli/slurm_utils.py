@@ -77,6 +77,13 @@ def _executor(job_name, nodes, tasks_per_node, gpus, timeout_min, log_dir):
     if slurm_qos:
         params["slurm_qos"] = slurm_qos
 
+    # CPUs per task (= per GPU rank). Without this Slurm uses its default
+    # (usually 1), which can leave a rank and NCCL's proxy/helper threads
+    # competing for one core. Set with `unitccl set cpus_per_task <n>`.
+    cpus_per_task = config.get("cpus_per_task")
+    if cpus_per_task:
+        params["cpus_per_task"] = int(cpus_per_task)
+
     modules = config.get("preload_modules") or []
     setup = ["source /etc/profile"]
     setup += [f"module load {m}" for m in modules]
