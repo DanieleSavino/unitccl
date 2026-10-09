@@ -5,6 +5,7 @@ best-algorithm heatmap (size x ranks). Consumes the
 """
 from __future__ import annotations
 
+from itertools import cycle
 from pathlib import Path
 from typing import List, Optional
 
@@ -17,29 +18,40 @@ import pandas as pd
 from .logging_utils import ok
 from .schema import find_protos, load_rank_sweep, records_to_df, size_to_bytes
 
-PLOT_COLORS = ["#00d2ff", "#ff6b6b", "#a8ff78", "#f7971e", "#c471ed"]
-
 # Short names used to annotate the best-algo heatmap cells.
 ALGO_ABBREV = {
     "BINE-SEND": "BS",
     "BINE-BLOCK_BY_BLOCK": "BB",
     "BINE-DOUBLE_SEND": "BD",
     "BINE-PERMUTATION": "BP",
+    "BINE-TREE" : "BT",
     "PAT": "P",
     "TREE": "T",
     "RING": "R",
 }
-# Fixed colors so an algo keeps its color across heatmaps.
-ALGO_HEAT_COLORS = {
+# Fixed colors so an algo keeps its color across every plot.
+ALGO_COLORS = {
     "BINE-SEND": "#00d2ff",
     "BINE-BLOCK_BY_BLOCK": "#3a7bd5",
     "BINE-DOUBLE_SEND": "#a8ff78",
     "BINE-PERMUTATION": "#c471ed",
+    "BINE-TREE": "#ff3cac",
     "PAT": "#f7971e",
     "TREE": "#f9e45b",
     "RING": "#ff6b6b",
 }
-_FALLBACK_HEAT_COLORS = ["#4ecdc4", "#ff9ff3", "#c8d6e5", "#ee5253", "#10ac84"]
+_FALLBACK_COLORS = ["#4ecdc4", "#ff9ff3", "#c8d6e5", "#ee5253", "#10ac84"]
+
+# Distinguishes rank counts when several are drawn in the same axes.
+_RANK_LINESTYLES = ["-", "--", ":", "-."]
+
+
+def _algo_colors(algos) -> dict:
+    """{algo: color}. Known algos get their fixed color; unknown ones get
+    fallback colors assigned in sorted order, so the result is deterministic.
+    Pass the full (unfiltered) algo list so colors stay stable across plots."""
+    fallback = cycle(_FALLBACK_COLORS)
+    return {a: ALGO_COLORS.get(a) or next(fallback) for a in sorted(algos)}
 
 
 def _abbrev(algo: str) -> str:
@@ -81,10 +93,9 @@ def plot_size(df: pd.DataFrame, collective: str, proto: str, out: Path) -> None:
     has_ranks = df["ranks"].notna().any()
     ranks_list = sorted(df["ranks"].dropna().astype(int).unique()) if has_ranks else [None]
     algos = sorted(df["algo"].unique())
+    colors = _algo_colors(algos)
 
-    color_idx = 0
-
-    for ranks in ranks_list:
+    for ri, ranks in enumerate(ranks_list):
         for algo in algos:
             if ranks is not None:
                 sub = df[(df["ranks"] == ranks) & (df["algo"] == algo)].sort_values("size_bytes")
@@ -102,10 +113,10 @@ def plot_size(df: pd.DataFrame, collective: str, proto: str, out: Path) -> None:
                 marker="D",
                 markersize=8,
                 linewidth=2.5,
-                color=PLOT_COLORS[color_idx % len(PLOT_COLORS)],
+                linestyle=_RANK_LINESTYLES[ri % len(_RANK_LINESTYLES)],
+                color=colors[algo],
                 label=label,
             )
-            color_idx += 1
 
     ax.set_xscale("log", base=2)
     ax.set_yscale("log")
@@ -125,15 +136,16 @@ def plot_diff(df: pd.DataFrame, collective: str, proto: str, out: Path, baseline
     has_ranks = df["ranks"].notna().any()
     ranks_list = sorted(df["ranks"].dropna().astype(int).unique()) if has_ranks else [None]
     algos = sorted(df["algo"].unique())
+    # Build the color map from the full sorted list BEFORE reordering, so
+    # colors match plot_size regardless of draw order.
+    colors = _algo_colors(algos)
 
-    # Ensure the baseline is plotted first so it receives the primary color (like cyan in the old plot)
+    # Draw the baseline first (legend order only; color is unaffected).
     if baseline_algo in algos:
         algos.remove(baseline_algo)
         algos.insert(0, baseline_algo)
 
-    color_idx = 0
-
-    for ranks in ranks_list:
+    for ri, ranks in enumerate(ranks_list):
         if ranks is not None:
             base_df = df[(df["ranks"] == ranks) & (df["algo"] == baseline_algo)]
         else:
@@ -169,19 +181,19 @@ def plot_diff(df: pd.DataFrame, collective: str, proto: str, out: Path, baseline
                 marker="D",
                 markersize=8,
                 linewidth=2.5,
-                color=PLOT_COLORS[color_idx % len(PLOT_COLORS)],
+                linestyle=_RANK_LINESTYLES[ri % len(_RANK_LINESTYLES)],
+                color=colors[algo],
                 label=label,
             )
-            color_idx += 1
 
     ax.set_xscale("log", base=2)
     _set_size_ticks(ax, df)
-    
+
     # Format Y-axis to show percentages (+300.0%, +0.0%, etc.)
     def perc_formatter(y, _):
         return f"{'+' if y > 0 else ''}{y:.1f}%"
     ax.yaxis.set_major_formatter(FuncFormatter(perc_formatter))
-    
+
     # Subtle zero-line reference
     ax.axhline(0, color="#ffffff", linewidth=1, linestyle=":", alpha=0.3)
     _style_legend(ax)
@@ -213,12 +225,13 @@ def plot_ranks(
         axes = axes.flatten()
 
     algos = sorted(df["algo"].unique())
+    colors = _algo_colors(algos)
 
     for ax, size_str in zip(axes, sizes):
         _apply_dark_theme(ax, "Ranks", "Latency (µs)", size_str)
         sub = df[df["size_str"] == size_str]
 
-        for i, algo in enumerate(algos):
+        for algo in algos:
             asub = sub[sub["algo"] == algo].sort_values("ranks")
             if asub.empty:
                 continue
@@ -229,7 +242,7 @@ def plot_ranks(
                 marker="D",
                 markersize=8,
                 linewidth=2.5,
-                color=PLOT_COLORS[i % len(PLOT_COLORS)],
+                color=colors[algo],
                 label=algo,
             )
         ax.set_xscale("log", base=2)
@@ -264,8 +277,8 @@ def plot_heatmap(df: pd.DataFrame, collective: str, proto: str, out: Path) -> No
     # All algos present (not just winners) so runners-up are in the legend too.
     algos = sorted(df["algo"].unique())
     algo_to_i = {a: i for i, a in enumerate(algos)}
-    fallback = iter(_FALLBACK_HEAT_COLORS * 4)
-    colors = [ALGO_HEAT_COLORS.get(a) or next(fallback) for a in algos]
+    color_map = _algo_colors(algos)
+    colors = [color_map[a] for a in algos]
 
     # Per cell: algos ordered best -> worst with slowdown vs the winner (%).
     grid = np.full((len(ranks_list), len(sizes)), np.nan)

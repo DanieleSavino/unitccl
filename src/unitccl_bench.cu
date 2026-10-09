@@ -377,6 +377,7 @@ int main(int argc, char **argv) {
     /* ── warmup ───────────────────────────────────────────────────────── */
 
     for (int iter = 0; iter < warmup; iter++) {
+	CUDA_CHECK(cudaMemset(d_recv, 0xFF, recv_bytes));   // 0xFFFFFFFF = NaN
         run_coll(coll, count, comm, stream, d_send, d_recv, world_rank);
         CUDA_CHECK(cudaStreamSynchronize(stream));
 
@@ -392,6 +393,7 @@ int main(int argc, char **argv) {
     float iter_stragglers_ms[iters];
 
     for (int iter = 0; iter < iters; iter++) {
+	CUDA_CHECK(cudaMemset(d_recv, 0xFF, recv_bytes));   // 0xFFFFFFFF = NaN
         MPI_Barrier(MPI_COMM_WORLD);
         CUDA_CHECK(cudaEventRecord(ev0, stream));
         run_coll(coll, count, comm, stream, d_send, d_recv, world_rank);

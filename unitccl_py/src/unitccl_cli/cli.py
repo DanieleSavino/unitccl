@@ -226,7 +226,7 @@ def build_parser() -> argparse.ArgumentParser:
         "mode", nargs="?", choices=["preload", "submit"], default=None,
         help="preload: apply preload_modules then run locally. submit: run on 1 allocated node, no GPU.",
     )
-    sp.add_argument("--buffman", help="Comma-separated buffer management modes (BLOCK_BY_BLOCK, SEND, DOUBLE_SEND, PERMUTATION)")
+    sp.add_argument("--buffman", help="Comma-separated buffer management modes (BLOCK_BY_BLOCK, SEND, DOUBLE_SEND, PERMUTATION, TREE)")
     sp.set_defaults(func=cmd_standalone)
 
     sp = sub.add_parser("scaling", help="Run scaling comparisons via fastest pools.")
