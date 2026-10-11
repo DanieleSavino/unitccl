@@ -1,7 +1,7 @@
 """unitccl command-line entrypoint.
 
-    unitccl standalone <preload> <submit> [--buffman SEND,DOUBLE_SEND]
-    unitccl scaling --coll Bcast,AllReduce --algo BINE,RING --proto SIMPLE --plot --csv --check --warmup 10 --iters 40 --repeats 3 --buffman SEND,BLOCK_BY_BLOCK
+    unitccl standalone <preload> <submit> [--binevar PAT,TREE] [--buffman SEND,DOUBLE_SEND]
+    unitccl scaling --coll Bcast,AllReduce --algo BINE,RING --proto SIMPLE --plot --csv --check --warmup 10 --iters 40 --repeats 3 --binevar PAT,TREE --buffman SEND,BLOCK_BY_BLOCK
     unitccl scaling --coll Bcast --proto SIMPLE --csv --ranks 4,8,16,32,64,128
     unitccl nccltests --coll AllGather --algo BINE,RING --proto SIMPLE --repeats 5 --plot --ranks 4,8,16,32,64,128
     unitccl nsys --outdir nsys --coll Bcast,Reduce --algo BINE,RING --proto SIMPLE --size 16777216 --nranks 8 --warmup 10 --iters 40 --check --buffman DOUBLE_SEND
@@ -27,6 +27,31 @@ from typing import List, Optional
 from . import config
 from .logging_utils import error, ok
 
+# ── bine variant / buffer-management args ────────────────────────────────────
+
+_BINEVAR_HELP = (
+    "Comma-separated Bine variants (NCCL_BINE_VARIANT): TREE, BUTTERFLY, PAT. "
+    "Crossed with --buffman, except TREE which runs once. BINE only"
+)
+
+
+def _add_bine_args(sp, buffman_help: str) -> None:
+    sp.add_argument("--binevar", "--variant", dest="binevar", help=_BINEVAR_HELP)
+    sp.add_argument("--buffman", help=buffman_help)
+
+
+def _csv(value: Optional[str]) -> Optional[List[str]]:
+    return [v.strip() for v in value.split(",") if v.strip()] if value else None
+
+
+def _bine_args(args):
+    """-> (binevars, buffmans) as lists (or None), validating the old TREE spelling."""
+    binevars, buffmans = _csv(args.binevar), _csv(args.buffman)
+    if buffmans and "TREE" in buffmans:
+        raise ValueError("TREE is a variant now, not a buffer-management mode: use --binevar TREE")
+    return binevars, buffmans
+
+
 # ── subcommands ──────────────────────────────────────────────────────────────
 
 def cmd_build(args) -> None:
@@ -49,11 +74,11 @@ def cmd_build(args) -> None:
 def cmd_standalone(args) -> None:
     from . import fastest_iface
 
+    binevars, buffmans = _bine_args(args)
+
     if args.mode == "submit":
         from . import slurm_utils
-        jobs = slurm_utils.submit_standalone(
-            buffmans=args.buffman.split(",") if args.buffman else None
-        )
+        jobs = slurm_utils.submit_standalone(buffmans=buffmans, binevars=binevars)
         slurm_utils.wait_for(jobs)
         return
 
@@ -62,8 +87,7 @@ def cmd_standalone(args) -> None:
         cfg = config.load()
         slurm_utils.apply_preload_modules(cfg.get("preload_modules") or [])
         
-    buffmans = args.buffman.split(",") if args.buffman else None
-    fastest_iface.run_standalone(buffmans=buffmans)
+    fastest_iface.run_standalone(buffmans=buffmans, binevars=binevars)
 
 
 def cmd_preload_add(args) -> None:
@@ -82,7 +106,8 @@ def cmd_preload_rm(args) -> None:
 
 def cmd_scaling(args) -> None:
     from . import fastest_iface, slurm_utils
-    
+
+    binevars, buffmans = _bine_args(args)
     scaling_kwargs = dict(
         colls=set(args.coll.split(",")) if args.coll else None,
         algos=set(args.algo.split(",")) if args.algo else None,
@@ -93,7 +118,8 @@ def cmd_scaling(args) -> None:
         warmup=args.warmup,
         iters=args.iters,
         n_repeats=args.repeats,
-        buffmans=set(args.buffman.split(",")) if args.buffman else None,
+        buffmans=set(buffmans) if buffmans else None,
+        binevars=set(binevars) if binevars else None,
     )
 
     if args.ranks:
@@ -113,6 +139,8 @@ def cmd_nccltests(args) -> None:
     def _set(v):
         return set(v.split(",")) if v else None
 
+    binevars, buffmans = _bine_args(args)
+
     kwargs = dict(
         colls=_set(args.coll),
         algos=_set(args.algo),
@@ -123,7 +151,8 @@ def cmd_nccltests(args) -> None:
         iters=args.iters,
         repeats=args.repeats,
         sizes=args.sizes.split(",") if args.sizes else None,
-        buffmans=_set(args.buffman),
+        buffmans=set(buffmans) if buffmans else None,
+        binevars=set(binevars) if binevars else None,
         avg_mode=args.avg,
         inplace=args.inplace,
         per_size=args.per_size,
@@ -155,14 +184,15 @@ def cmd_nsys(args) -> None:
     proto = args.proto.split(",")[0] if args.proto else "SIMPLE"
     sizes = [int(s) for s in args.size.split(",")]
     nranks_list = [int(r) for r in args.nranks.split(",")]
-    buffmans = args.buffman.split(",") if args.buffman else None
-    
+    binevars, buffmans = _bine_args(args)
+
     jobs = slurm_utils.submit_nsys_sweep(
         args.outdir, colls, algos, sizes=sizes, ranks_list=nranks_list, proto=proto,
         warmup=args.warmup,
         iters=args.iters,
         check=args.check,
-        buffmans=buffmans
+        buffmans=buffmans,
+        binevars=binevars,
     )
     slurm_utils.wait_for(jobs)
 
@@ -226,7 +256,7 @@ def build_parser() -> argparse.ArgumentParser:
         "mode", nargs="?", choices=["preload", "submit"], default=None,
         help="preload: apply preload_modules then run locally. submit: run on 1 allocated node, no GPU.",
     )
-    sp.add_argument("--buffman", help="Comma-separated buffer management modes (BLOCK_BY_BLOCK, SEND, DOUBLE_SEND, PERMUTATION, TREE)")
+    _add_bine_args(sp, "Comma-separated buffer management modes (BLOCK_BY_BLOCK, SEND, DOUBLE_SEND, PERMUTATION)")
     sp.set_defaults(func=cmd_standalone)
 
     sp = sub.add_parser("scaling", help="Run scaling comparisons via fastest pools.")
@@ -241,7 +271,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--repeats", type=int, default=1,
                     help="fastest compare n_repeats: independent launches (samples) per CSV row")
     sp.add_argument("--ranks", help="Comma-separated rank counts (triggers Slurm sweep)")
-    sp.add_argument("--buffman", help="Comma-separated buffer management modes")
+    _add_bine_args(sp, "Comma-separated buffer management modes")
     sp.set_defaults(func=cmd_scaling)
 
     sp = sub.add_parser(
@@ -261,7 +291,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--per-size", action="store_true",
                     help="one nccl-tests process (fresh communicator) per size instead of one sweep")
     sp.add_argument("--check", action="store_true", help="nccl-tests -c 1 (data verification)")
-    sp.add_argument("--buffman", help="Comma-separated buffer management modes (BINE only)")
+    _add_bine_args(sp, "Comma-separated buffer management modes (BINE only)")
     sp.add_argument("--extra", help="extra nccl-tests arguments, e.g. '-z 1'")
     sp.add_argument("--timeout", type=float, default=900.0, help="seconds per nccl-tests process before it is killed")
     sp.add_argument("--strict", action="store_true", help="raise (job FAILED) if any size failed/timed out/was wrong")
@@ -283,7 +313,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--warmup", type=int, help="Number of warmup iterations")
     sp.add_argument("--iters", type=int, help="Number of measured iterations")
     sp.add_argument("--check", action="store_true", help="Enable correctness verification")
-    sp.add_argument("--buffman", help="Comma-separated buffer management modes")
+    _add_bine_args(sp, "Comma-separated buffer management modes")
     sp.set_defaults(func=cmd_nsys)
 
     sp = sub.add_parser("plot", help="Plot rank-sweep data (time vs size, time vs ranks, or best-algo heatmap).")

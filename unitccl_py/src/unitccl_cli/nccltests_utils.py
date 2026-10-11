@@ -38,7 +38,7 @@ from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 import pandas as pd
 
-from . import config
+from . import config, nodes_utils
 from .logging_utils import color, error, info, ok, section, warn
 from .schema import load_fastest_csv, records_to_df, size_to_bytes
 
@@ -201,7 +201,8 @@ def _run_streaming(
 
 
 def _job_env(
-    algo: str, proto: str, buffman: Optional[str], extra_env: Optional[Dict[str, str]]
+    algo: str, proto: str, variant: Optional[str], buffman: Optional[str],
+    extra_env: Optional[Dict[str, str]],
 ) -> Tuple[Dict[str, str], List[str]]:
     """Environment for one run and the names `mpirun -x` must forward."""
     env = dict(os.environ)
@@ -209,10 +210,7 @@ def _job_env(
     env["NCCL_ALGO"] = algo
     env["NCCL_PROTO"] = proto
     env.setdefault("NCCL_DEBUG", "VERSION")  # prints the NCCL version actually loaded
-    if buffman:
-        env[config.BINE_BUFFER_MANAGEMENT_ENV] = buffman
-    else:
-        env.pop(config.BINE_BUFFER_MANAGEMENT_ENV, None)
+    config.apply_bine_env(env, variant, buffman)
     nccl_lib = config.get("nccl_lib")
     if nccl_lib:
         env["LD_LIBRARY_PATH"] = f"{nccl_lib}:{env.get('LD_LIBRARY_PATH', '')}".rstrip(":")
@@ -225,9 +223,11 @@ def _job_env(
 def _build_cmd(
     binary: Path, coll: str, nranks: int, b_total: int, e_total: int, factor: int,
     warmup: int, iters: int, cycles: int, check: bool, avg_mode: str,
-    forward: Sequence[str], extra: Sequence[str],
+    forward: Sequence[str], extra: Sequence[str], ppn: Optional[int] = None,
 ) -> List[str]:
     cmd = ["mpirun", "-n", str(nranks)]
+    if ppn:
+        cmd += ["--map-by", f"ppr:{ppn}:node"]
     for name in forward:
         cmd += ["-x", name]
     if shutil.which("stdbuf"):
@@ -260,16 +260,18 @@ def _report_fork(binary: Path, env: Dict[str, str]) -> None:
 
 
 def run_one(
-    coll: str, algo: str, proto: str, buffman: Optional[str], sizes: Sequence[int],
-    nranks: int, bin_dir: Path, warmup: int, iters: int, repeats: int, check: bool,
+    coll: str, algo: str, proto: str, variant: Optional[str], buffman: Optional[str],
+    sizes: Sequence[int], nranks: int, bin_dir: Path, warmup: int, iters: int, repeats: int, check: bool,
     avg_mode: str, inplace: bool, per_size: bool, timeout: float,
     extra: Sequence[str], extra_env: Optional[Dict[str, str]],
 ) -> Tuple[Dict[int, List[float]], List[str]]:
-    """One (coll, algo, proto, buffman) cell. Returns ({per_rank_bytes: [sample_ns]}, failures)."""
+    """One (coll, algo, proto, variant, buffman) cell. Returns ({per_rank_bytes: [sample_ns]}, failures)."""
     binary = bin_dir / NT_BINARIES[coll]
     if not binary.exists():
         raise RuntimeError(f"{binary} not found; run `unitccl build nccltests`")
-    env, forward = _job_env(algo, proto, buffman, extra_env)
+    env, forward = _job_env(algo, proto, variant, buffman, extra_env)
+    # NCCL PAT only supports one GPU per node
+    ppn = 1 if algo in config.SINGLE_GPU_ALGOS else None
     mult = nranks if coll in SCALES_WITH_RANKS else 1
     wanted = set(sizes)
     samples: Dict[int, List[float]] = {}
@@ -278,7 +280,7 @@ def run_one(
     for b_total, e_total, factor in plan_invocations(sizes, mult, per_size):
         cmd = _build_cmd(
             binary, coll, nranks, b_total, e_total, factor, warmup, iters, repeats,
-            check, avg_mode, forward, extra,
+            check, avg_mode, forward, extra, ppn,
         )
         info("$ " + " ".join(cmd))
         t0 = time.monotonic()
@@ -317,6 +319,7 @@ def run_scaling(
     nranks: int = 4,
     sizes: Optional[Sequence[str]] = None,
     buffmans: Optional[Set[str]] = None,
+    binevars: Optional[Set[str]] = None,
     avg_mode: str = "max",
     inplace: bool = False,
     per_size: bool = False,
@@ -326,8 +329,14 @@ def run_scaling(
     plot_dir: str = "plots",
     env_overrides: Optional[Dict[str, str]] = None,
     strict: bool = False,
+    merge_csv: bool = False,
+    baseline_algos: Optional[Set[str]] = None,
 ) -> List[str]:
-    """Run the matrix and write `<plot_dir>/<coll>/<coll>_<proto>.csv`. Returns csv paths."""
+    """Run the matrix and write `<plot_dir>/<coll>/<coll>_<proto>.csv`. Returns csv paths.
+
+    BINE rows are labelled `BINE[-<variant>][-<buffman>]` (see `config.bine_configs`).
+    `merge_csv` / `baseline_algos`: see `fastest_iface.run_scaling` (split PAT job).
+    """
     warmup = config.DEFAULT_WARMUP if warmup is None else warmup
     iters = config.DEFAULT_ITERS if iters is None else iters
     size_list = parse_sizes(sizes)
@@ -339,7 +348,9 @@ def run_scaling(
     section(f"nccl-tests scaling — {nranks} ranks")
     written: List[str] = []
     all_failures: List[str] = []
-    active_buffmans = sorted(buffmans) if buffmans else [None]
+    bine_cfgs = config.bine_configs(
+        sorted(binevars) if binevars else None, sorted(buffmans) if buffmans else None
+    )
     checked_links = False
 
     for coll in config.active(config.DEFAULT_COLLS, colls):
@@ -352,20 +363,25 @@ def run_scaling(
             continue
         file_dir = f"{plot_dir}/{coll}"
         os.makedirs(file_dir, exist_ok=True)
-        baseline_algo = coll_algos[0]
+        # rank -> node map next to the csv/plots; same mpirun mapping as the runs below
+        for single in (False, True):
+            if any((a in config.SINGLE_GPU_ALGOS) == single for a in coll_algos):
+                nodes_utils.export_nodes([file_dir], nranks, single_gpu=single)
+        baseline_algo = (config.active(config.DEFAULT_ALGOS.get(coll, {}), baseline_algos) or coll_algos)[0] \
+            if baseline_algos is not None else coll_algos[0]
 
         for proto in config.active(config.DEFAULT_PROTOS, protos):
             frames = []
             for algo in coll_algos:
-                for buffman in (active_buffmans if algo == "BINE" else [None]):
-                    label = f"{algo}-{buffman}" if buffman else algo
+                for variant, buffman in (bine_cfgs if algo == "BINE" else [(None, None)]):
+                    label = config.bine_label(algo, variant, buffman)
                     print(color(f"\n  {coll}  proto={proto}  algo={label}  (nccl-tests)", "blue"))
                     if not checked_links:
-                        env, _ = _job_env(algo, proto, buffman, env_overrides)
+                        env, _ = _job_env(algo, proto, variant, buffman, env_overrides)
                         _report_fork(bins / NT_BINARIES[coll], env)
                         checked_links = True
                     samples, failures = run_one(
-                        coll, algo, proto, buffman, size_list, nranks, bins, warmup, iters,
+                        coll, algo, proto, variant, buffman, size_list, nranks, bins, warmup, iters,
                         repeats, check, avg_mode, inplace, per_size, timeout, extra or [],
                         env_overrides,
                     )
@@ -374,7 +390,12 @@ def run_scaling(
 
             df = pd.concat(frames, ignore_index=True)
             csv_path = f"{file_dir}/{coll}_{proto}.csv"
-            if os.path.exists(csv_path):
+            if merge_csv and os.path.exists(csv_path):
+                prev = pd.read_csv(csv_path)
+                prev = prev[~prev["test"].isin(df["test"])]  # new rows win
+                df = pd.concat([prev, df], ignore_index=True)
+                info(f"merging into {csv_path}")
+            elif os.path.exists(csv_path):
                 warn(f"overwriting {csv_path}")
             df.to_csv(csv_path, index=False)
             written.append(csv_path)

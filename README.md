@@ -109,16 +109,16 @@ Everything (correctness tests, scaling comparisons, Slurm rank sweeps, nsys prof
 ```bash
 unitccl standalone                          # correctness tests, no Slurm
 unitccl standalone submit                   # same, but on 1 allocated node
-unitccl standalone --bine-buffer-management SEND
+unitccl standalone --binevar PAT,TREE --buffman SEND,DOUBLE_SEND   # NCCL_BINE_VARIANT x NCCL_BINE_BUFFER_MANAGEMENT
 
-unitccl scaling --coll Bcast,AllReduce --algo BINE,RING --proto SIMPLE --plot --csv --check --warmup 10 --iters 40 --bine-buffer-management SEND
+unitccl scaling --coll Bcast,AllReduce --algo BINE,RING --proto SIMPLE --plot --csv --check --warmup 10 --iters 40 --binevar PAT,TREE --buffman SEND,DOUBLE_SEND
 
 # submitit sweep: one independently-sized Slurm job per rank count, with a
 # live TUI dashboard (job table + scrolling log tail + cancel keys) while
 # it runs -- see unitccl_py/README.md for the keyboard controls.
 unitccl scaling --coll Bcast --proto SIMPLE --csv --ranks 4,8,16,32,64,128
 
-unitccl nsys --outdir nsys_out --coll Bcast,Reduce --algo BINE,RING --proto SIMPLE --size 16777216 --nranks 8 --warmup 10 --iters 40 --check --bine-buffer-management DOUBLE_SEND
+unitccl nsys --outdir nsys_out --coll Bcast,Reduce --algo BINE,RING --proto SIMPLE --size 16777216 --nranks 8 --warmup 10 --iters 40 --check --binevar PAT --buffman DOUBLE_SEND
 
 unitccl plot ranks --root . --collective Bcast,AllReduce --proto SIMPLE,LL
 unitccl plot size  --root . --collective Bcast --proto SIMPLE
@@ -131,6 +131,12 @@ unitccl set qos default
 See [`unitccl_py/README.md`](unitccl_py/README.md) for the full command
 reference, the live job dashboard's keyboard controls, dependency details,
 and the exact layout of generated output under `plots/`.
+
+### Bine variants and buffer management
+
+`--binevar` (alias `--variant`, `NCCL_BINE_VARIANT`: `TREE`, `BUTTERFLY`, `PAT`) and `--buffman` (`NCCL_BINE_BUFFER_MANAGEMENT`: `BLOCK_BY_BLOCK`, `PERMUTATION`, `DOUBLE_SEND`, `SEND`) select what the `BINE` algo runs. They are crossed, except `TREE`, which ignores buffer management and runs once: `--binevar PAT,TREE --buffman SEND,DOUBLE_SEND` runs `BINE-PAT-SEND`, `BINE-PAT-DOUBLE_SEND` and `BINE-TREE`.
+
+The Bine variant `PAT` is unrelated to NCCL's own `PAT` algo (`--algo PAT`). NCCL PAT only supports 1 GPU per node, so in `--ranks` sweeps it automatically runs in a separate 1-GPU-per-node Slurm job and its results are merged into the same CSVs; everything else keeps the configured `gpus_per_node`.
 
 ---
 

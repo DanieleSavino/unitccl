@@ -65,6 +65,7 @@ def run_profiles(
     check: bool = False,
     env_overrides: Optional[Dict[str, str]] = None,
     buffmans: Optional[List[str]] = None,
+    binevars: Optional[List[str]] = None,
 ) -> None:
     if shutil.which("nsys") is None:
         raise RuntimeError("'nsys' not found on PATH. Load/activate your Nsight Systems install first.")
@@ -79,22 +80,16 @@ def run_profiles(
     env.update(env_overrides or {})
     full_env = {**os.environ, **env}
     
-    active_buffmans = buffmans if buffmans else [None]
+    bine_cfgs = config.bine_configs(binevars, buffmans)
 
     for coll in colls:
         for algo in algos:
-            buffs = active_buffmans if algo == "BINE" else [None]
-            for buffman in buffs:
+            for variant, buffman in (bine_cfgs if algo == "BINE" else [(None, None)]):
                 run_env = full_env.copy()
                 run_env["NCCL_ALGO"] = algo
-                if buffman:
-                    run_env[config.BINE_BUFFER_MANAGEMENT_ENV] = buffman
-                    algo_label = f"{algo.lower()}-{buffman.lower()}"
-                else:
-                    algo_label = algo.lower()
-                    if config.BINE_BUFFER_MANAGEMENT_ENV in run_env:
-                        del run_env[config.BINE_BUFFER_MANAGEMENT_ENV]
-                        
+                config.apply_bine_env(run_env, variant, buffman)
+                algo_label = config.bine_label(algo, variant, buffman).lower()
+
                 name = f"{coll.lower()}_{algo_label}_nsys"
                 info(f"profiling {coll} with {algo_label.upper()}")
                 
@@ -102,6 +97,8 @@ def run_profiles(
                     "mpirun",
                     "-n",
                     str(nranks),
+                    # NCCL PAT only supports one GPU per node
+                    *(["--map-by", "ppr:1:node"] if algo in config.SINGLE_GPU_ALGOS else []),
                     "nsys",
                     "profile",
                     *NSYS_FLAGS,

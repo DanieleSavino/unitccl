@@ -15,7 +15,7 @@ from typing import Dict, List, Optional, Set
 
 import fastest
 
-from . import config
+from . import config, nodes_utils
 from .logging_utils import color, section
 
 PLOT_DIR = "plots"
@@ -43,23 +43,20 @@ def apply_env(
 
 
 def run_standalone(
-    env_overrides: Optional[Dict[str, str]] = None, 
-    buffmans: Optional[List[str]] = None
+    env_overrides: Optional[Dict[str, str]] = None,
+    buffmans: Optional[List[str]] = None,
+    binevars: Optional[List[str]] = None,
 ) -> None:
     backend = load_backend()
-    active_buffmans = buffmans if (buffmans and len(buffmans) > 0) else [None]
-    
-    for buff in active_buffmans:
+
+    for variant, buff in config.bine_configs(binevars, buffmans):
         curr_env = dict(env_overrides or {})
-        if buff:
-            section(f"standalone correctness — BINE BUFFER MAN: {buff}")
-            curr_env[config.BINE_BUFFER_MANAGEMENT_ENV] = buff
-        else:
-            section("standalone correctness")
-            if config.BINE_BUFFER_MANAGEMENT_ENV in os.environ:
-                del os.environ[config.BINE_BUFFER_MANAGEMENT_ENV]
-            
+        parts = [f"VARIANT: {variant}" if variant else None, f"BUFFER MAN: {buff}" if buff else None]
+        tag = ", ".join(p for p in parts if p)
+        section(f"standalone correctness — BINE {tag}" if tag else "standalone correctness")
+
         apply_env(check=True, iters=None, warmup=None, overrides=curr_env)
+        config.apply_bine_env(os.environ, variant, buff)
         for test in backend.get_subtests("standalone"):
             fastest.run_log(test["test_name"])
 
@@ -77,6 +74,9 @@ def run_scaling(
     plot_dir: str = PLOT_DIR,
     env_overrides: Optional[Dict[str, str]] = None,
     buffmans: Optional[Set[str]] = None,
+    binevars: Optional[Set[str]] = None,
+    merge_csv: bool = False,
+    baseline_algos: Optional[Set[str]] = None,
     tick_labels=None,
 ) -> List[str]:
     """Port of the current `tests.py` scaling block. Returns csv paths written.
@@ -84,6 +84,14 @@ def run_scaling(
     `plot_dir` is reused both for regular runs (defaults to "plots") and for
     rank-sweep runs, where `slurm_utils.submit_rank_sweep` passes
     `<N>_ranks` so csvs land in the layout `plot.py`'s loaders expect.
+
+    For BINE, every (variant, buffman) pair from `config.bine_configs` is run
+    and labelled `BINE[-<variant>][-<buffman>]`; TREE runs once, no buffman.
+
+    `merge_csv` / `baseline_algos` are used when a sweep is split into several
+    Slurm jobs (PAT needs 1 GPU/node): the later job merges its rows into the
+    CSV the earlier one wrote, and takes the diff-plot baseline from the
+    original, unsplit algo selection.
     """
     global_rank = int(os.environ.get("SLURM_PROCID", 0))
     if global_rank != 0:
@@ -95,7 +103,9 @@ def run_scaling(
     section("scaling comparison")
     active_colls = config.active(config.DEFAULT_COLLS, colls)
     active_protos = config.active(config.DEFAULT_PROTOS, protos)
-    active_buffmans = sorted(list(buffmans)) if buffmans else [None]
+    bine_cfgs = config.bine_configs(
+        sorted(binevars) if binevars else None, sorted(buffmans) if buffmans else None
+    )
 
     for coll in active_colls:
         coll_algos = config.active(config.DEFAULT_ALGOS.get(coll, {}), algos)
@@ -106,27 +116,31 @@ def run_scaling(
         file_dir = f"{plot_dir}/{coll}"
         if do_csv or do_plot:
             os.makedirs(file_dir, exist_ok=True)
+            # rank -> node map, next to the csv/plots. Layout mirrors bench_test.h:
+            # standard = ppr:<gpus_per_node>, PAT = ppr:1.
+            n_ranks = int(os.environ.get("SLURM_NTASKS") or os.environ.get(config.NRANKS_ENV) or 0)
+            for single in (False, True):
+                if any((a in config.SINGLE_GPU_ALGOS) == single for a in coll_algos):
+                    nodes_utils.export_nodes(
+                        [file_dir], n_ranks, single_gpu=single, ppn=config.get("gpus_per_node", 4)
+                    )
             
-        baseline_algo = coll_algos[0]
+        baseline_algo = (config.active(config.DEFAULT_ALGOS.get(coll, {}), baseline_algos) or coll_algos)[0] \
+            if baseline_algos is not None else coll_algos[0]
 
         for proto in active_protos:
             os.environ["NCCL_PROTO"] = proto
             proto_dfs = []
 
             for algo in coll_algos:
-                buffs = active_buffmans if algo == "BINE" else [None]
-                
-                for buffman in buffs:
+                cfgs = bine_cfgs if algo == "BINE" else [(None, None)]
+
+                for variant, buffman in cfgs:
                     curr_env = dict(env_overrides or {})
-                    if buffman:
-                        curr_env[config.BINE_BUFFER_MANAGEMENT_ENV] = buffman
-                        algo_label = f"{algo}-{buffman}"
-                    else:
-                        algo_label = algo
-                        if config.BINE_BUFFER_MANAGEMENT_ENV in os.environ:
-                            del os.environ[config.BINE_BUFFER_MANAGEMENT_ENV]
+                    algo_label = config.bine_label(algo, variant, buffman)
 
                     apply_env(check, iters, warmup, curr_env)
+                    config.apply_bine_env(os.environ, variant, buffman)
                     print(color(f"\n  {coll}  proto={proto}  algo={algo_label}", "blue"))
 
                     pool = fastest.pool_from_prefix(f"scaling/1kB_64MB/{algo}_{coll}")
@@ -145,6 +159,11 @@ def run_scaling(
                 csv_path = f"{file_dir}/{coll}_{proto}.csv"
                 
                 if do_csv or do_plot:
+                    if merge_csv and os.path.exists(csv_path):
+                        prev = pd.read_csv(csv_path)
+                        # new rows win over same-labelled rows from the earlier job
+                        prev = prev[~prev["test"].isin(final_df["test"])]
+                        final_df = pd.concat([prev, final_df], ignore_index=True)
                     final_df.to_csv(csv_path, index=False)
                     written.append(csv_path)
                     if do_csv:

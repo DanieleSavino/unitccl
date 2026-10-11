@@ -40,7 +40,14 @@ ALGO_COLORS = {
     "TREE": "#f9e45b",
     "RING": "#ff6b6b",
 }
-_FALLBACK_COLORS = ["#4ecdc4", "#ff9ff3", "#c8d6e5", "#ee5253", "#10ac84"]
+_FALLBACK_COLORS = [
+    "#4ecdc4", "#ff9ff3", "#c8d6e5", "#ee5253", "#10ac84",
+    "#feca57", "#54a0ff", "#5f27cd", "#01a3a4", "#ff9f43",
+]
+
+# Labels are BINE[-<variant>][-<buffman>] (see config.bine_label).
+_VARIANT_ABBREV = {"PAT": "Pa", "BUTTERFLY": "Bf", "TREE": "T"}
+_BUFFMAN_ABBREV = {"SEND": "S", "DOUBLE_SEND": "D", "BLOCK_BY_BLOCK": "B", "PERMUTATION": "P"}
 
 # Distinguishes rank counts when several are drawn in the same axes.
 _RANK_LINESTYLES = ["-", "--", ":", "-."]
@@ -57,6 +64,13 @@ def _algo_colors(algos) -> dict:
 def _abbrev(algo: str) -> str:
     if algo in ALGO_ABBREV:
         return ALGO_ABBREV[algo]
+    # BINE-<variant>[-<buffman>]: "Pa" / "Pa/S" (kept distinct from BINE-<buffman> like "BS")
+    if algo.startswith("BINE-"):
+        rest = algo[len("BINE-"):]
+        variant, _, buff = rest.partition("-")
+        if variant in _VARIANT_ABBREV:
+            v = _VARIANT_ABBREV[variant]
+            return f"{v}/{_BUFFMAN_ABBREV.get(buff, buff[:1])}" if buff else v
     # Unknown label: initials of its '-'/'_' separated parts.
     return "".join(w[0] for w in algo.replace("-", "_").split("_") if w).upper() or algo
 

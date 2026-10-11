@@ -53,7 +53,12 @@ def apply_preload_modules(modules: List[str]) -> None:
             os.environ[k] = v
 
 
-def _executor(job_name, nodes, tasks_per_node, gpus, timeout_min, log_dir):
+def _after(job) -> Optional[Dict[str, str]]:
+    """sbatch dependency that starts after `job` ends (any state), or None."""
+    return {"dependency": f"afterany:{job.job_id}"} if job is not None else None
+
+
+def _executor(job_name, nodes, tasks_per_node, gpus, timeout_min, log_dir, extra_slurm=None):
     _require_submitit()
     executor = submitit.AutoExecutor(folder=f"{log_dir}/%j")
     params = dict(
@@ -64,6 +69,8 @@ def _executor(job_name, nodes, tasks_per_node, gpus, timeout_min, log_dir):
     )
     if gpus > 0:
         params["slurm_gres"] = f"gpu:{gpus}"
+    if extra_slurm:
+        params["slurm_additional_parameters"] = dict(extra_slurm)
 
     slurm_partition = config.get("slurm_partition")
     if slurm_partition:
@@ -120,18 +127,40 @@ def submit_rank_sweep(
     timeout_min: int = 30,
     log_dir: str = "logs/sweep",
 ) -> List:
-    """Fire off one independently-sized submitit job per rank count."""
+    """Fire off one independently-sized submitit job per rank count.
+
+    If a single-GPU algo (NCCL PAT) is selected, each rank count gets a second
+    job for it with 1 GPU per node (nodes == ranks). It is chained after the
+    standard job (`afterany`) so the two never write the CSV at the same time;
+    it merges its rows into the standard job's CSV.
+    """
     gpus_per_node = gpus_per_node or config.get("gpus_per_node", 4)
+    groups = config.layout_groups(scaling_kwargs.get("colls"), scaling_kwargs.get("algos"))
+    split = len(groups) > 1
     jobs = []
     for ranks in ranks_list:
-        nodes = max(1, -(-ranks // gpus_per_node))  # ceil division
-        tasks_per_node = min(ranks, gpus_per_node)
-        gpus = min(ranks, gpus_per_node)
-        executor = _executor(f"unitccl-scaling-{ranks}", nodes, tasks_per_node, gpus, timeout_min, log_dir)
-        info(f"submitting ranks={ranks} nodes={nodes} gpus/node={gpus}")
-        job = executor.submit(_run_scaling_for_ranks, ranks, scaling_kwargs)
-        jobs.append(job)
-    ok(f"submitted {len(jobs)} jobs (one right-sized alloc per rank count)")
+        prev = None
+        for group_algos, single in groups:
+            gpn = 1 if single else gpus_per_node
+            nodes = max(1, -(-ranks // gpn))  # ceil division
+            tasks_per_node = min(ranks, gpn)
+            gpus = min(ranks, gpn)
+            kwargs = dict(scaling_kwargs, algos=group_algos)
+            if split:
+                kwargs["baseline_algos"] = scaling_kwargs.get("algos")
+                kwargs["merge_csv"] = single  # std job writes first, PAT merges after
+            suffix = "-pat" if single else ""
+            executor = _executor(
+                f"unitccl-scaling-{ranks}{suffix}", nodes, tasks_per_node, gpus, timeout_min, log_dir,
+                extra_slurm=_after(prev) if single else None,
+            )
+            info(f"submitting ranks={ranks} nodes={nodes} gpus/node={gpus}"
+                 + (f" (PAT, 1 GPU/node, after job {prev.job_id})" if single and prev else " (PAT, 1 GPU/node)" if single else ""))
+            job = executor.submit(_run_scaling_for_ranks, ranks, kwargs)
+            jobs.append(job)
+            prev = job
+    ok(f"submitted {len(jobs)} jobs (one right-sized alloc per rank count"
+       + (" and layout)" if split else ")"))
     return jobs
 
 
@@ -164,18 +193,34 @@ def submit_nccltests_sweep(
     timeout_min: int = 60,
     log_dir: str = "logs/nccltests",
 ) -> List:
-    """One independently-sized submitit job per rank count, running nccl-tests."""
+    """One independently-sized submitit job per rank count, running nccl-tests.
+    PAT gets its own 1-GPU-per-node job per rank count (see `submit_rank_sweep`)."""
     gpus_per_node = gpus_per_node or config.get("gpus_per_node", 4)
+    groups = config.layout_groups(nt_kwargs.get("colls"), nt_kwargs.get("algos"))
+    split = len(groups) > 1
     jobs = []
     for ranks in ranks_list:
-        nodes = max(1, -(-ranks // gpus_per_node))
-        per_node = min(ranks, gpus_per_node)
-        executor = _executor(
-            f"unitccl-nccltests-{ranks}", nodes, per_node, per_node, timeout_min, log_dir
-        )
-        info(f"submitting nccl-tests ranks={ranks} nodes={nodes} gpus/node={per_node}")
-        jobs.append(executor.submit(_run_nccltests_for_ranks, ranks, outdir, nt_kwargs))
-    ok(f"submitted {len(jobs)} nccl-tests jobs (one right-sized alloc per rank count)")
+        prev = None
+        for group_algos, single in groups:
+            gpn = 1 if single else gpus_per_node
+            nodes = max(1, -(-ranks // gpn))
+            per_node = min(ranks, gpn)
+            kwargs = dict(nt_kwargs, algos=group_algos)
+            if split:
+                kwargs["baseline_algos"] = nt_kwargs.get("algos")
+                kwargs["merge_csv"] = single
+            suffix = "-pat" if single else ""
+            executor = _executor(
+                f"unitccl-nccltests-{ranks}{suffix}", nodes, per_node, per_node, timeout_min, log_dir,
+                extra_slurm=_after(prev) if single else None,
+            )
+            info(f"submitting nccl-tests ranks={ranks} nodes={nodes} gpus/node={per_node}"
+                 + (" (PAT)" if single else ""))
+            job = executor.submit(_run_nccltests_for_ranks, ranks, outdir, kwargs)
+            jobs.append(job)
+            prev = job
+    ok(f"submitted {len(jobs)} nccl-tests jobs (one right-sized alloc per rank count"
+       + (" and layout)" if split else ")"))
     return jobs
 
 
@@ -196,7 +241,7 @@ def submit_build(
     return [job]
 
 
-def _run_nsys_job(outdir_str, colls, algos, sizes, nranks, proto, warmup, iters, check, buffmans=None, env_overrides=None):
+def _run_nsys_job(outdir_str, colls, algos, sizes, nranks, proto, warmup, iters, check, buffmans=None, env_overrides=None, binevars=None, gpus_per_node=None):
     from pathlib import Path
     from . import nsys_utils
 
@@ -205,7 +250,7 @@ def _run_nsys_job(outdir_str, colls, algos, sizes, nranks, proto, warmup, iters,
     if rank != 0:
         return
 
-    gpus_per_node = config.get("gpus_per_node", 4)
+    gpus_per_node = gpus_per_node or config.get("gpus_per_node", 4)
     job_env_overrides = dict(os.environ)
     if env_overrides:
         job_env_overrides.update(env_overrides)
@@ -220,10 +265,16 @@ def _run_nsys_job(outdir_str, colls, algos, sizes, nranks, proto, warmup, iters,
         nsys_utils.run_profiles(
             outdir, colls, algos,
             size=size, nranks=nranks, proto=proto,
-            warmup=warmup, iters=iters, check=check, env_overrides=job_env_overrides, buffmans=buffmans
+            warmup=warmup, iters=iters, check=check, env_overrides=job_env_overrides, buffmans=buffmans,
+            binevars=binevars,
         )
         nsys_utils.generate_stats(outdir)
         nsys_utils.analyze(outdir)
+        # rank -> node map next to per_rank_metrics.csv and the plots
+        from . import nodes_utils
+        for single in (False, True):
+            if any((a in config.SINGLE_GPU_ALGOS) == single for a in algos):
+                nodes_utils.export_nodes([outdir / "plots"], nranks, single_gpu=single)
 
 
 def submit_nsys(
@@ -241,16 +292,20 @@ def submit_nsys(
     gpus_per_node: Optional[int] = None,
     timeout_min: int = 60,
     log_dir: str = "logs/nsys",
+    binevars: Optional[List[str]] = None,
+    after=None,
+    name_suffix: str = "",
 ) -> List:
     gpus_per_node = gpus_per_node or config.get("gpus_per_node", 4)
     nodes = max(1, -(-nranks // gpus_per_node))
     executor = _executor(
-        f"unitccl-nsys-{nranks}", nodes, tasks_per_node=gpus_per_node, gpus=gpus_per_node,
-        timeout_min=timeout_min, log_dir=log_dir,
+        f"unitccl-nsys-{nranks}{name_suffix}", nodes, tasks_per_node=gpus_per_node, gpus=gpus_per_node,
+        timeout_min=timeout_min, log_dir=log_dir, extra_slurm=_after(after),
     )
     info(f"submitting nsys job nranks={nranks} nodes={nodes} gpus/node={gpus_per_node} sizes={sizes} (1 task/node)")
     job = executor.submit(
-        _run_nsys_job, str(outdir), colls, algos, sizes, nranks, proto, warmup, iters, check, buffmans, env_overrides
+        _run_nsys_job, str(outdir), colls, algos, sizes, nranks, proto, warmup, iters, check, buffmans,
+        env_overrides, binevars, gpus_per_node,
     )
     ok("submitted 1 job")
     return [job]
@@ -279,37 +334,55 @@ def submit_nsys_sweep(
     gpus_per_node: Optional[int] = None,
     timeout_min: int = 60,
     log_dir: str = "logs/nsys",
+    binevars: Optional[List[str]] = None,
 ) -> List:
     from pathlib import Path
+
+    gpus_per_node = gpus_per_node or config.get("gpus_per_node", 4)
+    # PAT (NCCL algo) needs 1 GPU/node -> its own job per rank count, chained
+    # after the standard one since both write into the same outdir.
+    std_algos = [a for a in algos if a not in config.SINGLE_GPU_ALGOS]
+    single_algos = [a for a in algos if a in config.SINGLE_GPU_ALGOS]
+    groups = ([(std_algos, gpus_per_node, "")] if std_algos else []) + \
+             ([(single_algos, 1, "-pat")] if single_algos else [])
 
     jobs = []
     for nranks in ranks_list:
         sub_outdir = Path(outdir) / f"{nranks:03d}_ranks"
-        jobs.extend(
-            submit_nsys(
-                sub_outdir, colls, algos, sizes=sizes, nranks=nranks, proto=proto,
+        prev = None
+        for group_algos, gpn, suffix in groups:
+            new = submit_nsys(
+                sub_outdir, colls, group_algos, sizes=sizes, nranks=nranks, proto=proto,
                 warmup=warmup, iters=iters, check=check, buffmans=buffmans, env_overrides=env_overrides,
-                gpus_per_node=gpus_per_node, timeout_min=timeout_min, log_dir=log_dir,
+                gpus_per_node=gpn, timeout_min=timeout_min, log_dir=log_dir,
+                binevars=binevars, after=prev if suffix else None, name_suffix=suffix,
             )
-        )
-    ok(f"submitted {len(jobs)} nsys jobs ({len(ranks_list)} rank counts, {len(sizes)} sizes each, one alloc per rank count)")
+            jobs.extend(new)
+            prev = new[-1]
+    ok(f"submitted {len(jobs)} nsys jobs ({len(ranks_list)} rank counts, {len(sizes)} sizes each, one alloc per rank count"
+       + (" and layout)" if len(groups) > 1 else ")"))
     return jobs
 
 
-def _run_standalone_job(buffmans: Optional[List[str]] = None, env_overrides: Optional[Dict[str, str]] = None):
+def _run_standalone_job(
+    buffmans: Optional[List[str]] = None,
+    env_overrides: Optional[Dict[str, str]] = None,
+    binevars: Optional[List[str]] = None,
+):
     from . import fastest_iface
-    fastest_iface.run_standalone(env_overrides=env_overrides, buffmans=buffmans)
+    fastest_iface.run_standalone(env_overrides=env_overrides, buffmans=buffmans, binevars=binevars)
 
 
 def submit_standalone(
-    buffmans: Optional[List[str]] = None, 
-    timeout_min: int = 30, 
-    log_dir: str = "logs/standalone", 
-    env_overrides: Optional[Dict[str, str]] = None
+    buffmans: Optional[List[str]] = None,
+    timeout_min: int = 30,
+    log_dir: str = "logs/standalone",
+    env_overrides: Optional[Dict[str, str]] = None,
+    binevars: Optional[List[str]] = None,
 ) -> List:
     executor = _executor("unitccl-standalone", nodes=1, tasks_per_node=1, gpus=0, timeout_min=timeout_min, log_dir=log_dir)
     info("submitting standalone job (1 node, no gpu)")
-    job = executor.submit(_run_standalone_job, buffmans, env_overrides)
+    job = executor.submit(_run_standalone_job, buffmans, env_overrides, binevars)
     ok("submitted 1 job")
     return [job]
 

@@ -24,12 +24,17 @@ static int run_bench(const char *coll, const char *algo, size_t nbytes,
         fprintf(stderr, "SLURM_NTASKS not set\n");
     }
 
+    int ppn = 1;
+    const char *tpn = getenv("SLURM_NTASKS_PER_NODE");
+    if (tpn && atoi(tpn) > 0) ppn = atoi(tpn);
+
     char cmd[512];
     snprintf(cmd, sizeof(cmd),
-        "CUDA_VISIBLE_DEVICES=0,1,2,3 NCCL_ALGO=%s "
-        "mpirun -np %d --map-by ppr:4:node "
-	"build/unitccl_bench %s %zu 2>&1",
-	algo, world_size, coll, nbytes / sizeof(float));
+        "NCCL_ALGO=%s mpirun -np %d --map-by ppr:%d:node -x NCCL_ALGO "
+        "build/unitccl_bench %s %zu 2>&1",
+        algo, world_size, ppn, coll, nbytes / sizeof(float));
+
+    printf("[bench] cmd: %s\n", cmd);
 
     FILE *fp = popen(cmd, "r");
     if (!fp) {

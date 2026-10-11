@@ -77,7 +77,7 @@ src/unitccl_cli/
 unitccl standalone
 unitccl standalone preload      # apply preload_modules, then run locally
 unitccl standalone submit       # run on 1 allocated node, no GPU
-unitccl standalone --buffman SEND,DOUBLE_SEND  # override NCCL_BINE_BUFFER_MANAGEMENT
+unitccl standalone --binevar PAT,TREE --buffman SEND,DOUBLE_SEND  # override NCCL_BINE_VARIANT / NCCL_BINE_BUFFER_MANAGEMENT
 
 # Build nccl / fastest / unitccl / all.
 unitccl build unitccl
@@ -85,7 +85,7 @@ unitccl build all --clean --submit  # clean build, submitted as a Slurm job
 unitccl build nccl --preload        # apply preload_modules, then build locally
 
 # Scaling comparison via fastest pools (matches the original tests.py behavior).
-unitccl scaling --coll Bcast,AllReduce --algo BINE,RING --proto SIMPLE --plot --csv --check --warmup 10 --iters 40 --buffman SEND,BLOCK_BY_BLOCK
+unitccl scaling --coll Bcast,AllReduce --algo BINE,RING --proto SIMPLE --plot --csv --check --warmup 10 --iters 40 --binevar PAT,TREE --buffman SEND,BLOCK_BY_BLOCK
 
 # Same, but swept across rank counts: submits one independently-sized
 # submitit/Slurm job per rank count (no shared oversized allocation), then
@@ -99,12 +99,16 @@ unitccl scaling --coll Bcast --proto SIMPLE --csv --ranks 4,8,16,32,64,128
 # `unitccl plot ...` and the Δ-vs-baseline plots just work. --repeats R = R
 # nccl-tests cycles (-N) = R samples per row (mean/stddev/min/max/median).
 unitccl nccltests --coll AllGather --algo BINE,RING --proto SIMPLE --repeats 5 --plot --ranks 4,8,16,32,64,128
-unitccl nccltests --coll AllGather --buffman SEND,BLOCK_BY_BLOCK --nranks 8 --outdir plots/008_ranks   # local, inside an allocation
+unitccl nccltests --coll AllGather --binevar PAT --buffman SEND,BLOCK_BY_BLOCK --nranks 8 --outdir plots/008_ranks   # local, inside an allocation
 unitccl nccltests --coll AllGather --sizes 1kB,64kB,1MB,16MB --ranks 8,16   # custom per-rank sizes
 
 # Capture nsys profiles for BINE vs RING, export nsys-stats CSVs, and
 # generate the bine-vs-ring comparison plots -- all in one call.
-unitccl nsys --outdir nsys_out --coll Bcast,Reduce --algo BINE,RING --proto SIMPLE --size 16777216 --nranks 8 --warmup 10 --iters 40 --check --buffman SEND,DOUBLE_SEND
+unitccl nsys --outdir nsys_out --coll Bcast,Reduce --algo BINE,RING --proto SIMPLE --size 16777216 --nranks 8 --warmup 10 --iters 40 --check --binevar PAT,TREE --buffman SEND,DOUBLE_SEND
+
+# NCCL algo PAT needs 1 GPU per node: in --ranks sweeps it is split into its own
+# job automatically (see "Bine variants and PAT" below).
+unitccl scaling --coll AllGather --algo PAT,RING,BINE --proto SIMPLE --csv --ranks 4,8,16
 
 # Plot a rank sweep already on disk.
 unitccl plot ranks --root . --collective Bcast,AllReduce --proto SIMPLE,LL
@@ -141,7 +145,7 @@ commands above with those values) when switching clusters.
 `unitccl nccltests` runs `all_gather_perf` / `all_reduce_perf` / `broadcast_perf` /
 `reduce_perf` / `reduce_scatter_perf` (AllGatherV has no nccl-tests binary and is
 skipped) under `mpirun`, one rank per GPU, with the same `NCCL_ALGO` /
-`NCCL_PROTO` / `NCCL_BINE_BUFFER_MANAGEMENT` matrix as `scaling`. Rank sweeps use
+`NCCL_PROTO` / `NCCL_BINE_VARIANT` / `NCCL_BINE_BUFFER_MANAGEMENT` matrix as `scaling`. Rank sweeps use
 one right-sized Slurm job per rank count and launch `mpirun` from task 0, the same
 pattern as the nsys jobs.
 
@@ -155,9 +159,10 @@ do it on a login node). To use an existing checkout instead:
 | Flag | Default | Meaning |
 |---|---|---|
 | `--coll` | all | Comma-separated: AllGather, AllReduce, Bcast, Reduce, ReduceScatter |
-| `--algo` | per-collective defaults | `NCCL_ALGO` values; the first one is the baseline of the `_diff` plot |
+| `--algo` | per-collective defaults | `NCCL_ALGO` values; the first one is the baseline of the `_diff` plot. With no `--algo` the algos flagged `True` in `config.DEFAULT_ALGOS` run; an explicit `--algo` runs exactly what you name (e.g. `PAT`, which is off by default), for collectives that list it |
 | `--proto` | SIMPLE,LL,LL128 | `NCCL_PROTO` values |
-| `--buffman` | none | BINE buffer management modes, e.g. `SEND,BLOCK_BY_BLOCK`; BINE rows are labelled `BINE-<mode>` |
+| `--buffman` | none | BINE buffer management modes: `BLOCK_BY_BLOCK`, `PERMUTATION`, `DOUBLE_SEND`, `SEND` (`NCCL_BINE_BUFFER_MANAGEMENT`). `TREE` is a variant now: use `--binevar TREE` |
+| `--binevar` (alias `--variant`) | none | BINE variants `TREE`, `BUTTERFLY`, `PAT` (`NCCL_BINE_VARIANT`). Crossed with `--buffman`, except `TREE` which runs once. Rows are labelled `BINE[-<variant>][-<mode>]`, e.g. `BINE-PAT-SEND`, `BINE-TREE` |
 | `--sizes` | `1kB,16kB,256kB,1MB,4MB,64MB` | **Per-rank** message sizes, see below |
 | `--warmup` | 10 | nccl-tests `-w` |
 | `--iters` | 40 | nccl-tests `-n`, timed back to back |
@@ -254,6 +259,7 @@ plots/
 ├── 004_ranks/                          # one folder per `--ranks=` value, %03d-padded
 │   ├── Bcast/
 │   │   ├── Bcast_SIMPLE.csv            # written directly by the sweep job
+│   │   ├── nodes.csv                   # rank,node map of the job (nodes_pat.csv for the PAT job)
 │   │   ├── Bcast_SIMPLE.png            # written by `unitccl plot`
 │   │   ├── Bcast_SIMPLE_diff.png       # BINE vs RING difference plot
 │   │   ├── Bcast_LL.csv / .png / _diff.png
@@ -267,6 +273,7 @@ plots/
 │   └── Reduce/
 └── <nsys outdir>/
     └── <run_label>/<PROTO>/
+        ├── nodes.csv                   # rank,node map (nodes_pat.csv for the PAT job)
         ├── per_rank_metrics.csv
         ├── summary_by_algo_collective.csv
         ├── nccl_collective_op_time.png
@@ -278,6 +285,25 @@ plots/
         └── {bcast,reduce}_per_rank_op_time.png
 ```
 
+`nodes.csv` has one `rank,node` row per MPI rank (e.g. `0,lrdn0123`), so you can see which nodes a result came from. It is measured by a throwaway `mpirun` that uses the same `--map-by` as the benchmark launch (`ppr:<gpus_per_node>` for the standard layout; `ppr:1` for PAT, which writes `nodes_pat.csv` so the two jobs don't overwrite each other). If the probe fails it only warns; the benchmark still runs.
+
 `<N>_ranks/<Coll>/<Coll>_<PROTO>.csv` is what the submitit sweep jobs write
 directly; `plotting.py` reads those csvs back for both `plot ranks` and
 `plot size`, and `nsys_utils.py` owns the `nsys/`-shaped subtree above.
+
+## Bine variants and PAT
+
+`--binevar` (alias `--variant`) sets `NCCL_BINE_VARIANT` and is available on `standalone`, `scaling`, `nccltests` and `nsys`, next to `--buffman`. Variants are `TREE`, `BUTTERFLY` and `PAT`. `PAT` and `BUTTERFLY` have per-mode buffer-management implementations, so each is run once per `--buffman` mode; `TREE` ignores the mode and runs once.
+
+```bash
+unitccl scaling --algo BINE --binevar PAT,TREE --buffman SEND,DOUBLE_SEND
+# -> BINE-PAT-SEND, BINE-PAT-DOUBLE_SEND, BINE-TREE
+```
+
+BINE rows are labelled `BINE[-<variant>][-<mode>]` in the CSVs and plots (nsys files use the lower-case label, e.g. `bine-pat-send`). With only `--buffman` you get `BINE-<mode>` as before; with neither, plain `BINE`. Non-BINE algos never see either variable.
+
+### NCCL algo PAT vs. Bine variant PAT
+
+They are unrelated. The NCCL **algo** `PAT` (`--algo PAT`) only supports 1 GPU per node, so in `--ranks` sweeps (`scaling`, `nccltests`, `nsys`) it automatically gets its own Slurm job per rank count with `nodes == ranks` (1 task and 1 GPU per node), and `mpirun` uses `--map-by ppr:1:node` for it. That job is chained after the standard one (`sbatch --dependency=afterany`) and merges its rows into the same CSV, so plots show everything together. The diff-plot baseline is taken from the full algo selection. All other algos, including the Bine **variant** `PAT`, keep the configured `gpus_per_node`.
+
+Local runs without `--ranks` are not split: they use whatever allocation you are in.
