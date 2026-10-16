@@ -106,8 +106,8 @@ unitccl nccltests --coll AllGather --sizes 1kB,64kB,1MB,16MB --ranks 8,16   # cu
 # generate the bine-vs-ring comparison plots -- all in one call.
 unitccl nsys --outdir nsys_out --coll Bcast,Reduce --algo BINE,RING --proto SIMPLE --size 16777216 --nranks 8 --warmup 10 --iters 40 --check --binevar PAT,TREE --buffman SEND,DOUBLE_SEND
 
-# NCCL algo PAT needs 1 GPU per node: in --ranks sweeps it is split into its own
-# job automatically (see "Bine variants and PAT" below).
+# NCCL algo PAT needs 1 GPU per node: if PAT is in --algo, the WHOLE sweep (all
+# algos) runs 1 GPU per node (see "Bine variants and PAT" below).
 unitccl scaling --coll AllGather --algo PAT,RING,BINE --proto SIMPLE --csv --ranks 4,8,16
 
 # Plot a rank sweep already on disk.
@@ -259,7 +259,7 @@ plots/
 ├── 004_ranks/                          # one folder per `--ranks=` value, %03d-padded
 │   ├── Bcast/
 │   │   ├── Bcast_SIMPLE.csv            # written directly by the sweep job
-│   │   ├── nodes.csv                   # rank,node map of the job (nodes_pat.csv for the PAT job)
+│   │   ├── nodes.csv                   # rank,node map of the job (nodes_pat.csv when PAT is in the sweep)
 │   │   ├── Bcast_SIMPLE.png            # written by `unitccl plot`
 │   │   ├── Bcast_SIMPLE_diff.png       # BINE vs RING difference plot
 │   │   ├── Bcast_LL.csv / .png / _diff.png
@@ -273,7 +273,7 @@ plots/
 │   └── Reduce/
 └── <nsys outdir>/
     └── <run_label>/<PROTO>/
-        ├── nodes.csv                   # rank,node map (nodes_pat.csv for the PAT job)
+        ├── nodes.csv                   # rank,node map (nodes_pat.csv when PAT is in the sweep)
         ├── per_rank_metrics.csv
         ├── summary_by_algo_collective.csv
         ├── nccl_collective_op_time.png
@@ -285,7 +285,7 @@ plots/
         └── {bcast,reduce}_per_rank_op_time.png
 ```
 
-`nodes.csv` has one `rank,node` row per MPI rank (e.g. `0,lrdn0123`), so you can see which nodes a result came from. It is measured by a throwaway `mpirun` that uses the same `--map-by` as the benchmark launch (`ppr:<gpus_per_node>` for the standard layout; `ppr:1` for PAT, which writes `nodes_pat.csv` so the two jobs don't overwrite each other). If the probe fails it only warns; the benchmark still runs.
+`nodes.csv` has one `rank,node` row per MPI rank (e.g. `0,lrdn0123`), so you can see which nodes a result came from. It is measured by a throwaway `mpirun` that uses the same `--map-by` as the benchmark launch (`ppr:<gpus_per_node>` for the standard layout; `ppr:1` when PAT is in the sweep, which writes `nodes_pat.csv`). If the probe fails it only warns; the benchmark still runs.
 
 `<N>_ranks/<Coll>/<Coll>_<PROTO>.csv` is what the submitit sweep jobs write
 directly; `plotting.py` reads those csvs back for both `plot ranks` and
@@ -304,6 +304,6 @@ BINE rows are labelled `BINE[-<variant>][-<mode>]` in the CSVs and plots (nsys f
 
 ### NCCL algo PAT vs. Bine variant PAT
 
-They are unrelated. The NCCL **algo** `PAT` (`--algo PAT`) only supports 1 GPU per node, so in `--ranks` sweeps (`scaling`, `nccltests`, `nsys`) it automatically gets its own Slurm job per rank count with `nodes == ranks` (1 task and 1 GPU per node), and `mpirun` uses `--map-by ppr:1:node` for it. That job is chained after the standard one (`sbatch --dependency=afterany`) and merges its rows into the same CSV, so plots show everything together. The diff-plot baseline is taken from the full algo selection. All other algos, including the Bine **variant** `PAT`, keep the configured `gpus_per_node`.
+They are unrelated. The NCCL **algo** `PAT` (`--algo PAT`) only supports 1 GPU per node. To keep comparisons apples to apples, selecting it makes the **whole sweep** (`scaling`, `nccltests`, `nsys`) run 1 GPU per node: one Slurm job per rank count with `nodes == ranks` (1 task and 1 GPU per node), and `mpirun` uses `--map-by ppr:1:node` for every algo, not just PAT. Without PAT in `--algo`, the configured `gpus_per_node` is used. The Bine **variant** `PAT` (`--binevar PAT`) is unrelated and does not trigger this.
 
 Local runs without `--ranks` are not split: they use whatever allocation you are in.

@@ -129,10 +129,9 @@ def submit_rank_sweep(
 ) -> List:
     """Fire off one independently-sized submitit job per rank count.
 
-    If a single-GPU algo (NCCL PAT) is selected, each rank count gets a second
-    job for it with 1 GPU per node (nodes == ranks). It is chained after the
-    standard job (`afterany`) so the two never write the CSV at the same time;
-    it merges its rows into the standard job's CSV.
+    If a single-GPU algo (NCCL PAT) is selected, the whole sweep (all algos)
+    runs with 1 GPU per node (nodes == ranks), so every algo is measured on
+    the same topology.
     """
     gpus_per_node = gpus_per_node or config.get("gpus_per_node", 4)
     groups = config.layout_groups(scaling_kwargs.get("colls"), scaling_kwargs.get("algos"))
@@ -149,18 +148,17 @@ def submit_rank_sweep(
             if split:
                 kwargs["baseline_algos"] = scaling_kwargs.get("algos")
                 kwargs["merge_csv"] = single  # std job writes first, PAT merges after
-            suffix = "-pat" if single else ""
+            suffix = "-1gpn" if single else ""
             executor = _executor(
                 f"unitccl-scaling-{ranks}{suffix}", nodes, tasks_per_node, gpus, timeout_min, log_dir,
-                extra_slurm=_after(prev) if single else None,
+                extra_slurm=_after(prev) if single and prev else None,
             )
             info(f"submitting ranks={ranks} nodes={nodes} gpus/node={gpus}"
-                 + (f" (PAT, 1 GPU/node, after job {prev.job_id})" if single and prev else " (PAT, 1 GPU/node)" if single else ""))
+                 + (" (PAT selected: all algos at 1 GPU/node)" if single else ""))
             job = executor.submit(_run_scaling_for_ranks, ranks, kwargs)
             jobs.append(job)
             prev = job
-    ok(f"submitted {len(jobs)} jobs (one right-sized alloc per rank count"
-       + (" and layout)" if split else ")"))
+    ok(f"submitted {len(jobs)} jobs (one right-sized alloc per rank count)")
     return jobs
 
 
@@ -194,7 +192,7 @@ def submit_nccltests_sweep(
     log_dir: str = "logs/nccltests",
 ) -> List:
     """One independently-sized submitit job per rank count, running nccl-tests.
-    PAT gets its own 1-GPU-per-node job per rank count (see `submit_rank_sweep`)."""
+    If PAT is selected the whole sweep runs 1 GPU per node (see `submit_rank_sweep`)."""
     gpus_per_node = gpus_per_node or config.get("gpus_per_node", 4)
     groups = config.layout_groups(nt_kwargs.get("colls"), nt_kwargs.get("algos"))
     split = len(groups) > 1
@@ -209,18 +207,17 @@ def submit_nccltests_sweep(
             if split:
                 kwargs["baseline_algos"] = nt_kwargs.get("algos")
                 kwargs["merge_csv"] = single
-            suffix = "-pat" if single else ""
+            suffix = "-1gpn" if single else ""
             executor = _executor(
                 f"unitccl-nccltests-{ranks}{suffix}", nodes, per_node, per_node, timeout_min, log_dir,
-                extra_slurm=_after(prev) if single else None,
+                extra_slurm=_after(prev) if single and prev else None,
             )
             info(f"submitting nccl-tests ranks={ranks} nodes={nodes} gpus/node={per_node}"
-                 + (" (PAT)" if single else ""))
+                 + (" (PAT selected: all algos at 1 GPU/node)" if single else ""))
             job = executor.submit(_run_nccltests_for_ranks, ranks, outdir, kwargs)
             jobs.append(job)
             prev = job
-    ok(f"submitted {len(jobs)} nccl-tests jobs (one right-sized alloc per rank count"
-       + (" and layout)" if split else ")"))
+    ok(f"submitted {len(jobs)} nccl-tests jobs (one right-sized alloc per rank count)")
     return jobs
 
 
@@ -272,9 +269,11 @@ def _run_nsys_job(outdir_str, colls, algos, sizes, nranks, proto, warmup, iters,
         nsys_utils.analyze(outdir)
         # rank -> node map next to per_rank_metrics.csv and the plots
         from . import nodes_utils
-        for single in (False, True):
-            if any((a in config.SINGLE_GPU_ALGOS) == single for a in algos):
-                nodes_utils.export_nodes([outdir / "plots"], nranks, single_gpu=single)
+        nodes_utils.export_nodes(
+            [outdir / "plots"], nranks,
+            single_gpu=any(a in config.SINGLE_GPU_ALGOS for a in algos),
+            ppn=gpus_per_node,
+        )
 
 
 def submit_nsys(
@@ -339,12 +338,12 @@ def submit_nsys_sweep(
     from pathlib import Path
 
     gpus_per_node = gpus_per_node or config.get("gpus_per_node", 4)
-    # PAT (NCCL algo) needs 1 GPU/node -> its own job per rank count, chained
-    # after the standard one since both write into the same outdir.
-    std_algos = [a for a in algos if a not in config.SINGLE_GPU_ALGOS]
-    single_algos = [a for a in algos if a in config.SINGLE_GPU_ALGOS]
-    groups = ([(std_algos, gpus_per_node, "")] if std_algos else []) + \
-             ([(single_algos, 1, "-pat")] if single_algos else [])
+    # PAT (NCCL algo) needs 1 GPU/node -> the whole sweep runs 1 GPU/node so
+    # all algos are profiled on the same layout.
+    if any(a in config.SINGLE_GPU_ALGOS for a in algos):
+        groups = [(list(algos), 1, "-1gpn")]
+    else:
+        groups = [(list(algos), gpus_per_node, "")]
 
     jobs = []
     for nranks in ranks_list:
@@ -360,7 +359,7 @@ def submit_nsys_sweep(
             jobs.extend(new)
             prev = new[-1]
     ok(f"submitted {len(jobs)} nsys jobs ({len(ranks_list)} rank counts, {len(sizes)} sizes each, one alloc per rank count"
-       + (" and layout)" if len(groups) > 1 else ")"))
+       + ")")
     return jobs
 
 

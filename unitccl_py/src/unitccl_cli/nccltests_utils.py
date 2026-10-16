@@ -264,14 +264,16 @@ def run_one(
     sizes: Sequence[int], nranks: int, bin_dir: Path, warmup: int, iters: int, repeats: int, check: bool,
     avg_mode: str, inplace: bool, per_size: bool, timeout: float,
     extra: Sequence[str], extra_env: Optional[Dict[str, str]],
+    one_gpn: bool = False,
 ) -> Tuple[Dict[int, List[float]], List[str]]:
     """One (coll, algo, proto, variant, buffman) cell. Returns ({per_rank_bytes: [sample_ns]}, failures)."""
     binary = bin_dir / NT_BINARIES[coll]
     if not binary.exists():
         raise RuntimeError(f"{binary} not found; run `unitccl build nccltests`")
     env, forward = _job_env(algo, proto, variant, buffman, extra_env)
-    # NCCL PAT only supports one GPU per node
-    ppn = 1 if algo in config.SINGLE_GPU_ALGOS else None
+    # NCCL PAT only supports one GPU per node; `one_gpn` (PAT in the sweep)
+    # puts every algo on that layout so results are comparable
+    ppn = 1 if (one_gpn or algo in config.SINGLE_GPU_ALGOS) else None
     mult = nranks if coll in SCALES_WITH_RANKS else 1
     wanted = set(sizes)
     samples: Dict[int, List[float]] = {}
@@ -352,6 +354,7 @@ def run_scaling(
         sorted(binevars) if binevars else None, sorted(buffmans) if buffmans else None
     )
     checked_links = False
+    one_gpn = config.single_gpu_sweep(colls, algos)  # PAT selected -> whole sweep 1 GPU/node
 
     for coll in config.active(config.DEFAULT_COLLS, colls):
         if coll not in NT_BINARIES:
@@ -364,9 +367,7 @@ def run_scaling(
         file_dir = f"{plot_dir}/{coll}"
         os.makedirs(file_dir, exist_ok=True)
         # rank -> node map next to the csv/plots; same mpirun mapping as the runs below
-        for single in (False, True):
-            if any((a in config.SINGLE_GPU_ALGOS) == single for a in coll_algos):
-                nodes_utils.export_nodes([file_dir], nranks, single_gpu=single)
+        nodes_utils.export_nodes([file_dir], nranks, single_gpu=one_gpn)
         baseline_algo = (config.active(config.DEFAULT_ALGOS.get(coll, {}), baseline_algos) or coll_algos)[0] \
             if baseline_algos is not None else coll_algos[0]
 
@@ -383,7 +384,7 @@ def run_scaling(
                     samples, failures = run_one(
                         coll, algo, proto, variant, buffman, size_list, nranks, bins, warmup, iters,
                         repeats, check, avg_mode, inplace, per_size, timeout, extra or [],
-                        env_overrides,
+                        env_overrides, one_gpn,
                     )
                     all_failures += failures
                     frames.append(_to_frame(coll, algo, label, lo, hi, size_list, samples))

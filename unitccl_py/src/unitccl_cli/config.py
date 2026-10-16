@@ -14,7 +14,7 @@ import os
 from pathlib import Path
 from typing import Dict, Iterable, List, MutableMapping, Optional, Set, Tuple
 
-from .logging_utils import warn
+from .logging_utils import info, warn
 
 # ── env vars read by the C benchmark binary (unitccl_bench) ────────────────
 CHECK_ENV = "UNITCCL_CHECK"
@@ -29,8 +29,10 @@ BINE_VARIANT_ENV = "NCCL_BINE_VARIANT"
 # whatever --buffman says (PAT and BUTTERFLY have per-mode implementations).
 BUFFMAN_INDIFFERENT_VARIANTS = {"TREE"}
 
-# NCCL algos that only work with one GPU per node. They get their own
-# right-sized Slurm job (nodes == ranks) and `mpirun --map-by ppr:1:node`.
+# NCCL algos that only work with one GPU per node. If any of them is part of a
+# sweep, the WHOLE sweep (every algo) runs 1 GPU/node -- a right-sized Slurm
+# job (nodes == ranks) and `mpirun --map-by ppr:1:node` -- so all algos see the
+# same topology and the results are comparable.
 # Note this is the NCCL *algo* PAT, not the Bine *variant* PAT.
 SINGLE_GPU_ALGOS = {"PAT"}
 
@@ -217,30 +219,35 @@ def apply_bine_env(env: MutableMapping[str, str], variant: Optional[str], buffma
 # ── per-algo GPUs-per-node layout ───────────────────────────────────────────
 
 
+def single_gpu_sweep(colls, algos) -> bool:
+    """True if the selection contains an effective SINGLE_GPU_ALGOS algo (PAT),
+    i.e. the whole sweep must run 1 GPU per node. `colls` / `algos` may be None
+    (defaults) or any iterable of names."""
+    colls = set(colls) if colls is not None else None
+    algos = set(algos) if algos is not None else None
+    return any(
+        a in SINGLE_GPU_ALGOS
+        for coll in active(DEFAULT_COLLS, colls)
+        for a in active(DEFAULT_ALGOS.get(coll, {}), algos)
+    )
+
+
 def layout_groups(
     colls: Optional[Set[str]], algos: Optional[Set[str]]
 ) -> List[Tuple[Optional[Set[str]], bool]]:
-    """Split an algo selection into Slurm layout groups: [(algo_filter, single_gpu)].
+    """Slurm layout groups: [(algo_filter, single_gpu)].
 
-    Algos in SINGLE_GPU_ALGOS (PAT) need 1 GPU per node; the rest use the
-    configured gpus_per_node. Without an effective single-GPU algo this is
-    just [(algos, False)] (unchanged behaviour). The standard group, if any,
-    comes first.
+    Always a single group. If a SINGLE_GPU_ALGOS algo (PAT) is effectively
+    selected, that group is 1 GPU/node and contains *all* requested algos, so
+    PAT and the others are measured on the same topology (apples to apples).
+    Otherwise it is [(algos, False)] with the configured gpus_per_node.
     """
-    std: Set[str] = set()
-    single: Set[str] = set()
-    for coll in active(DEFAULT_COLLS, colls):
-        for a in active(DEFAULT_ALGOS.get(coll, {}), algos):
-            (single if a in SINGLE_GPU_ALGOS else std).add(a)
-
+    if single_gpu_sweep(colls, algos):
+        info(f"{sorted((algos or set()) & SINGLE_GPU_ALGOS)} selected: running the whole sweep "
+             "with 1 GPU per node so all algos use the same layout")
+        return [(algos, True)]
     requested = (algos or set()) & SINGLE_GPU_ALGOS
-    if requested and not single:
+    if requested:
         warn(f"{sorted(requested)} requested but not available for the selected "
              "collectives in config.DEFAULT_ALGOS; it will be skipped")
-    if not single:
-        return [(algos, False)]
-    groups: List[Tuple[Optional[Set[str]], bool]] = []
-    if std:
-        groups.append((std, False))
-    groups.append((single, True))
-    return groups
+    return [(algos, False)]

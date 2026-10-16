@@ -99,6 +99,7 @@ def run_scaling(
 
     load_backend()
     written: List[str] = []
+    one_gpn = config.single_gpu_sweep(colls, algos)  # PAT selected -> whole sweep 1 GPU/node
 
     section("scaling comparison")
     active_colls = config.active(config.DEFAULT_COLLS, colls)
@@ -116,15 +117,13 @@ def run_scaling(
         file_dir = f"{plot_dir}/{coll}"
         if do_csv or do_plot:
             os.makedirs(file_dir, exist_ok=True)
-            # rank -> node map, next to the csv/plots. Layout mirrors bench_test.h:
-            # standard = ppr:<gpus_per_node>, PAT = ppr:1.
+            # rank -> node map, next to the csv/plots. If PAT is in the sweep every
+            # algo runs ppr:1; otherwise ppr:<gpus_per_node>.
             n_ranks = int(os.environ.get("SLURM_NTASKS") or os.environ.get(config.NRANKS_ENV) or 0)
-            for single in (False, True):
-                if any((a in config.SINGLE_GPU_ALGOS) == single for a in coll_algos):
-                    nodes_utils.export_nodes(
-                        [file_dir], n_ranks, single_gpu=single, ppn=config.get("gpus_per_node", 4)
-                    )
-            
+            nodes_utils.export_nodes(
+                [file_dir], n_ranks, single_gpu=one_gpn, ppn=config.get("gpus_per_node", 4)
+            )
+
         baseline_algo = (config.active(config.DEFAULT_ALGOS.get(coll, {}), baseline_algos) or coll_algos)[0] \
             if baseline_algos is not None else coll_algos[0]
 

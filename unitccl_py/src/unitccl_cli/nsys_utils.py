@@ -81,6 +81,8 @@ def run_profiles(
     full_env = {**os.environ, **env}
     
     bine_cfgs = config.bine_configs(binevars, buffmans)
+    # PAT in the sweep -> every algo runs 1 GPU/node (same topology for all)
+    one_gpn = any(a in config.SINGLE_GPU_ALGOS for a in algos)
 
     for coll in colls:
         for algo in algos:
@@ -97,8 +99,9 @@ def run_profiles(
                     "mpirun",
                     "-n",
                     str(nranks),
-                    # NCCL PAT only supports one GPU per node
-                    *(["--map-by", "ppr:1:node"] if algo in config.SINGLE_GPU_ALGOS else []),
+                    # NCCL PAT only supports one GPU per node; with PAT in the
+                    # sweep all algos use that layout so results are comparable
+                    *(["--map-by", "ppr:1:node"] if one_gpn else []),
                     "nsys",
                     "profile",
                     *NSYS_FLAGS,
