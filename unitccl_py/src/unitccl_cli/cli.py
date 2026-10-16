@@ -7,7 +7,7 @@
     unitccl nsys --outdir nsys --coll Bcast,Reduce --algo BINE,RING --proto SIMPLE --size 16777216 --nranks 8 --warmup 10 --iters 40 --check --buffman DOUBLE_SEND
     unitccl plot ranks --root . --collective Bcast,AllReduce --proto SIMPLE,LL [--size 4MB]
     unitccl plot size  --root . --collective Bcast --proto SIMPLE
-    unitccl plot heatmap --root . --collective AllReduce --proto SIMPLE
+    unitccl plot heatmap --root . --collective AllReduce --proto SIMPLE [--algo BINE]
     unitccl set account <value>
     unitccl set partition <value>
     unitccl set qos <value>
@@ -204,7 +204,9 @@ def cmd_plot(args) -> None:
     collectives = args.collective.split(",")
     protos = args.proto.split(",") if args.proto else None
     outdir = Path(args.outdir)
-    plotting.run_plot_command(args.mode, root, collectives, protos, outdir, size_filter=args.size)
+    plotting.run_plot_command(
+        args.mode, root, collectives, protos, outdir, size_filter=args.size, algos=_csv(args.algo)
+    )
 
 
 # `unitccl set <what>` -> key in config.json
@@ -321,6 +323,12 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--root", default=".", help="Root dir containing <N>_ranks folders")
     sp.add_argument("--collective", "--coll", dest="collective", required=True, help="Comma-separated collectives")
     sp.add_argument("--proto", default=None, help="Comma-separated protocols (default: autodetect)")
+    sp.add_argument(
+        "--algo", default=None,
+        help="Comma-separated algos to plot (default: all). Matches a label or its '-'-prefix, case-insensitive: "
+        "BINE = all Bine, BINE-PAT = both PAT-variant buffmans, BINE-BUTTERFLY-SEND, BINE,RING, or globs like 'BINE-*-SEND'. "
+        "Output files get a suffix so full plots aren't overwritten",
+    )
     sp.add_argument("--size", default=None, help="(mode=ranks) restrict to one message size, e.g. 4MB")
     sp.add_argument("--outdir", default="plots", help="Output directory for PNGs")
     sp.set_defaults(func=cmd_plot)

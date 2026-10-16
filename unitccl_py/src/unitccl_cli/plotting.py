@@ -5,6 +5,8 @@ best-algorithm heatmap (size x ranks). Consumes the
 """
 from __future__ import annotations
 
+import re
+from fnmatch import fnmatchcase
 from itertools import cycle
 from pathlib import Path
 from typing import List, Optional
@@ -15,35 +17,47 @@ from matplotlib.ticker import FuncFormatter
 import numpy as np
 import pandas as pd
 
-from .logging_utils import ok
+from .logging_utils import ok, warn
 from .schema import find_protos, load_rank_sweep, records_to_df, size_to_bytes
 
 # Short names used to annotate the best-algo heatmap cells.
 ALGO_ABBREV = {
-    "BINE-SEND": "BS",
-    "BINE-BLOCK_BY_BLOCK": "BB",
-    "BINE-DOUBLE_SEND": "BD",
-    "BINE-PERMUTATION": "BP",
-    "BINE-TREE" : "BT",
+    "BINE-TREE": "BT",
     "PAT": "P",
     "TREE": "T",
     "RING": "R",
 }
 # Fixed colors so an algo keeps its color across every plot.
+# Labels are BINE-TREE or BINE-<variant>-<buffman> (variant: BUTTERFLY | PAT).
+# Baselines are cool/neutral; each Bine variant owns a hue family (BUTTERFLY =
+# reds/oranges, PAT = purples/magentas, TREE = teal) with one shade per buffman
+# mode, and each buffman mode also has its own marker (see _BUFFMAN_MARKERS).
 ALGO_COLORS = {
-    "BINE-SEND": "#00d2ff",
-    "BINE-BLOCK_BY_BLOCK": "#3a7bd5",
-    "BINE-DOUBLE_SEND": "#a8ff78",
-    "BINE-PERMUTATION": "#c471ed",
-    "BINE-TREE": "#ff3cac",
-    "PAT": "#f7971e",
-    "TREE": "#f9e45b",
-    "RING": "#ff6b6b",
+    "RING": "#d62828",                          # red
+    "TREE": "#495057",                          # slate
+    "PAT": "#2f9e44",                           # green (NCCL algo)
+    "BINE-TREE": "#f77f00",                     # orange
+    "BINE-BUTTERFLY-SEND": "#1c7eff",           # blue
+    "BINE-BUTTERFLY-DOUBLE_SEND": "#0c8599",    # teal
+    "BINE-BUTTERFLY-BLOCK_BY_BLOCK": "#8c1c13", # maroon
+    "BINE-BUTTERFLY-PERMUTATION": "#f2b705",    # amber
+    "BINE-PAT-SEND": "#7b2cbf",                 # purple
+    "BINE-PAT-DOUBLE_SEND": "#c77dff",          # light violet
+    "BINE-PAT-BLOCK_BY_BLOCK": "#3c1a7a",       # deep indigo
+    "BINE-PAT-PERMUTATION": "#d63384",          # magenta
 }
 _FALLBACK_COLORS = [
-    "#4ecdc4", "#ff9ff3", "#c8d6e5", "#ee5253", "#10ac84",
-    "#feca57", "#54a0ff", "#5f27cd", "#01a3a4", "#ff9f43",
+    "#5f3dc4", "#099268", "#a0522d", "#3b5bdb", "#868e96",
+    "#74b816", "#e8590c", "#364fc7", "#c2255c", "#22b8cf",
 ]
+_BUFFMAN_MARKERS = {"SEND": "o", "DOUBLE_SEND": "s", "BLOCK_BY_BLOCK": "^", "PERMUTATION": "D"}
+
+# Light, publication-style theme (white background, thin dotted grid).
+_FG = "#000000"          # text, spines, ticks
+_GRID = "#b0b0b0"        # grid lines
+_BG = "#ffffff"          # figure/axes background
+_MISSING = "#eeeeee"     # heatmap cells without data
+_LINE_KW = dict(markersize=5, linewidth=1.6)
 
 # Labels are BINE[-<variant>][-<buffman>] (see config.bine_label).
 _VARIANT_ABBREV = {"PAT": "Pa", "BUTTERFLY": "Bf", "TREE": "T"}
@@ -75,22 +89,41 @@ def _abbrev(algo: str) -> str:
     return "".join(w[0] for w in algo.replace("-", "_").split("_") if w).upper() or algo
 
 
-def _apply_dark_theme(ax, xlabel: str, ylabel: str, title: str):
-    ax.set_facecolor("#1a1a2e")
-    ax.grid(True, color="#333355", linestyle=":", alpha=0.5)
-    ax.tick_params(colors="#aaaaaa", which="both")
+def _algo_marker(algo: str) -> str:
+    """Marker keyed on the buffer-management suffix of BINE-<variant>-<buffman>
+    labels (so shades within a variant family stay distinguishable in print);
+    everything else gets a circle."""
+    if algo.startswith("BINE-"):
+        _, _, buff = algo[len("BINE-"):].partition("-")
+        return _BUFFMAN_MARKERS.get(buff, "o")
+    return "o"
+
+
+def _apply_theme(ax, xlabel: str, ylabel: str, title: str):
+    ax.set_facecolor(_BG)
+    ax.grid(True, which="major", color=_GRID, linestyle=":", linewidth=0.6, alpha=0.9)
+    ax.grid(True, which="minor", color=_GRID, linestyle=":", linewidth=0.4, alpha=0.5)
+    ax.set_axisbelow(True)
+    ax.tick_params(colors=_FG, which="both")
     for spine in ax.spines.values():
-        spine.set_color("#aaaaaa")
-    ax.set_xlabel(xlabel, color="#cccccc", fontsize=11)
-    ax.set_ylabel(ylabel, color="#cccccc", fontsize=11)
-    ax.set_title(title, color="#e0e0e0", fontsize=13)
+        spine.set_color(_FG)
+    ax.set_xlabel(xlabel, color=_FG, fontsize=10)
+    ax.set_ylabel(ylabel, color=_FG, fontsize=10)
+    ax.set_title(title, color=_FG, fontsize=12)
 
 
 def _style_legend(ax):
-    legend = ax.legend(loc="upper left", fontsize=10, facecolor="#1a1a2e", edgecolor="#333355")
-    if legend:
-        for text in legend.get_texts():
-            text.set_color("#cccccc")
+    handles, _ = ax.get_legend_handles_labels()
+    if not handles:
+        return
+    ax.legend(loc="upper left", fontsize=8, facecolor=_BG, edgecolor="#cccccc", framealpha=0.9)
+
+
+def _text_color_for(hex_color: str) -> str:
+    """Black or white text, whichever contrasts better with the given fill."""
+    r, g, b = (int(hex_color[i : i + 2], 16) / 255.0 for i in (1, 3, 5))
+    lum = 0.2126 * r + 0.7152 * g + 0.0722 * b
+    return "#111111" if lum > 0.45 else "#ffffff"
 
 
 def _set_size_ticks(ax, df):
@@ -100,52 +133,80 @@ def _set_size_ticks(ax, df):
     ax.set_xticklabels([byte_to_str[b] for b in unique_bytes])
 
 
-def plot_size(df: pd.DataFrame, collective: str, proto: str, out: Path) -> None:
-    fig, ax = plt.subplots(figsize=(9, 6), facecolor="#1a1a2e")
-    _apply_dark_theme(ax, "Message size", "Latency (µs)", f"{collective} scaling — {proto}")
+def _draw_size_lines(ax, df, algos, colors, ranks, linestyle="-", label_ranks=False):
+    for algo in algos:
+        if ranks is not None:
+            sub = df[(df["ranks"] == ranks) & (df["algo"] == algo)].sort_values("size_bytes")
+        else:
+            sub = df[(df["ranks"].isna()) & (df["algo"] == algo)].sort_values("size_bytes")
+        if sub.empty:
+            continue
+        ax.plot(
+            sub["size_bytes"],
+            sub["mean_ns"] / 1e3,
+            **_LINE_KW,
+            marker=_algo_marker(algo),
+            linestyle=linestyle,
+            color=colors[algo],
+            label=f"{algo} - {ranks} ranks" if (label_ranks and ranks is not None) else algo,
+        )
 
+
+def plot_size(df: pd.DataFrame, collective: str, proto: str, out: Path) -> None:
     has_ranks = df["ranks"].notna().any()
     ranks_list = sorted(df["ranks"].dropna().astype(int).unique()) if has_ranks else [None]
     algos = sorted(df["algo"].unique())
     colors = _algo_colors(algos)
+    title = f"{collective} scaling — {proto}"
 
-    for ri, ranks in enumerate(ranks_list):
-        for algo in algos:
-            if ranks is not None:
-                sub = df[(df["ranks"] == ranks) & (df["algo"] == algo)].sort_values("size_bytes")
-                label = f"{algo} - {ranks} ranks"
-            else:
-                sub = df[(df["ranks"].isna()) & (df["algo"] == algo)].sort_values("size_bytes")
-                label = f"{algo}"
-
-            if sub.empty:
-                continue
-
-            ax.plot(
-                sub["size_bytes"],
-                sub["mean_ns"] / 1e3,
-                marker="D",
-                markersize=8,
-                linewidth=2.5,
-                linestyle=_RANK_LINESTYLES[ri % len(_RANK_LINESTYLES)],
-                color=colors[algo],
-                label=label,
-            )
-
-    ax.set_xscale("log", base=2)
-    ax.set_yscale("log")
-    _set_size_ticks(ax, df)
-    _style_legend(ax)
-
-    fig.tight_layout()
-    fig.savefig(out, dpi=200, facecolor="#1a1a2e")
+    if len(ranks_list) <= 1:
+        fig, ax = plt.subplots(figsize=(9, 6), facecolor=_BG)
+        _apply_theme(ax, "Message size", "Latency (µs)", title)
+        _draw_size_lines(ax, df, algos, colors, ranks_list[0], label_ranks=True)
+        ax.set_xscale("log", base=2)
+        ax.set_yscale("log")
+        _set_size_ticks(ax, df)
+        _style_legend(ax)
+        fig.tight_layout()
+        fig.savefig(out, dpi=200, facecolor=_BG)
+    else:
+        # Several rank counts: one panel per rank count + one shared legend,
+        # instead of algos x ranks overlaid on a single axis.
+        n = len(ranks_list)
+        ncols = min(3, n)
+        nrows = -(-n // ncols)
+        fig, axes = plt.subplots(
+            nrows, ncols, figsize=(5.0 * ncols, 3.8 * nrows), facecolor=_BG, squeeze=False
+        )
+        flat = list(axes.flat)
+        for ax, ranks in zip(flat, ranks_list):
+            sub_df = df[df["ranks"] == ranks]
+            _apply_theme(ax, "Message size", "Latency (µs)", f"{ranks} ranks")
+            _draw_size_lines(ax, sub_df, algos, colors, ranks)
+            ax.set_xscale("log", base=2)
+            ax.set_yscale("log")
+            _set_size_ticks(ax, sub_df)
+        for ax in flat[n:]:
+            ax.set_visible(False)
+        handles, labels = {}, {}
+        for ax in flat[:n]:
+            for h, l in zip(*ax.get_legend_handles_labels()):
+                handles.setdefault(l, h)
+        order = [a for a in algos if a in handles]
+        fig.suptitle(title, color=_FG, fontsize=12)
+        fig.tight_layout(rect=(0, 0, 1, 0.97))
+        fig.legend(
+            [handles[a] for a in order], order, loc="center left", bbox_to_anchor=(1.0, 0.5),
+            fontsize=8, facecolor=_BG, edgecolor="#cccccc", framealpha=0.9,
+        )
+        fig.savefig(out, dpi=200, facecolor=_BG, bbox_inches="tight")
     plt.close(fig)
     ok(f"wrote {out}")
 
 
 def plot_diff(df: pd.DataFrame, collective: str, proto: str, out: Path, baseline_algo: str) -> None:
-    fig, ax = plt.subplots(figsize=(9, 6), facecolor="#1a1a2e")
-    _apply_dark_theme(ax, "Message size", f"Δ vs {baseline_algo}", f"{collective} scaling — {proto}  (Δ vs {baseline_algo})")
+    fig, ax = plt.subplots(figsize=(9, 6), facecolor=_BG)
+    _apply_theme(ax, "Message size", f"Δ vs {baseline_algo}", f"{collective} scaling — {proto}  (Δ vs {baseline_algo})")
 
     has_ranks = df["ranks"].notna().any()
     ranks_list = sorted(df["ranks"].dropna().astype(int).unique()) if has_ranks else [None]
@@ -192,9 +253,8 @@ def plot_diff(df: pd.DataFrame, collective: str, proto: str, out: Path, baseline
             ax.plot(
                 sub["size_bytes"],
                 y_diff,
-                marker="D",
-                markersize=8,
-                linewidth=2.5,
+                **_LINE_KW,
+                marker=_algo_marker(algo),
                 linestyle=_RANK_LINESTYLES[ri % len(_RANK_LINESTYLES)],
                 color=colors[algo],
                 label=label,
@@ -209,11 +269,11 @@ def plot_diff(df: pd.DataFrame, collective: str, proto: str, out: Path, baseline
     ax.yaxis.set_major_formatter(FuncFormatter(perc_formatter))
 
     # Subtle zero-line reference
-    ax.axhline(0, color="#ffffff", linewidth=1, linestyle=":", alpha=0.3)
+    ax.axhline(0, color=_FG, linewidth=0.8, linestyle="--", alpha=0.5)
     _style_legend(ax)
 
     fig.tight_layout()
-    fig.savefig(out, dpi=200, facecolor="#1a1a2e")
+    fig.savefig(out, dpi=200, facecolor=_BG)
     plt.close(fig)
     ok(f"wrote {out}")
 
@@ -221,7 +281,7 @@ def plot_diff(df: pd.DataFrame, collective: str, proto: str, out: Path, baseline
 def plot_ranks(
     df: pd.DataFrame, collective: str, proto: str, out: Path, size_filter: Optional[str] = None
 ) -> None:
-    fig_facecolor = "#1a1a2e"
+    fig_facecolor = _BG
 
     if size_filter:
         sizes = [size_filter]
@@ -242,7 +302,7 @@ def plot_ranks(
     colors = _algo_colors(algos)
 
     for ax, size_str in zip(axes, sizes):
-        _apply_dark_theme(ax, "Ranks", "Latency (µs)", size_str)
+        _apply_theme(ax, "Ranks", "Latency (µs)", size_str)
         sub = df[df["size_str"] == size_str]
 
         for algo in algos:
@@ -253,9 +313,8 @@ def plot_ranks(
             ax.plot(
                 asub["ranks"],
                 asub["mean_ns"] / 1e3,
-                marker="D",
-                markersize=8,
-                linewidth=2.5,
+                **_LINE_KW,
+                marker=_algo_marker(algo),
                 color=colors[algo],
                 label=algo,
             )
@@ -268,7 +327,7 @@ def plot_ranks(
     for ax in axes[len(sizes) :]:
         ax.axis("off")
 
-    fig.suptitle(f"{collective} ({proto}) — time vs ranks", color="#e0e0e0", fontsize=14)
+    fig.suptitle(f"{collective} ({proto}) — time vs ranks", color=_FG, fontsize=12)
     fig.tight_layout()
     fig.savefig(out, dpi=200, facecolor=fig_facecolor)
     plt.close(fig)
@@ -307,19 +366,19 @@ def plot_heatmap(df: pd.DataFrame, collective: str, proto: str, out: Path) -> No
             for a, ns in zip(g["algo"], g["mean_ns"])
         ]
 
-    fig_facecolor = "#1a1a2e"
+    fig_facecolor = _BG
     fig, ax = plt.subplots(
         figsize=(max(7, 1.5 * len(sizes) + 3), max(4, 1.0 * len(ranks_list) + 2.5)),
         facecolor=fig_facecolor,
     )
     cmap = ListedColormap(colors)
-    cmap.set_bad("#2a2a44")
+    cmap.set_bad(_MISSING)
     ax.imshow(
         np.ma.masked_invalid(grid), cmap=cmap, vmin=-0.5, vmax=len(algos) - 0.5,
         aspect="auto", origin="lower",
     )
 
-    _apply_dark_theme(ax, "Message size", "Ranks", f"{collective} ({proto}) — best algorithm")
+    _apply_theme(ax, "Message size", "Ranks", f"{collective} ({proto}) — best algorithm")
     ax.grid(False)
     ax.set_xticks(range(len(sizes)))
     ax.set_xticklabels([byte_to_str[b] for b in sizes])
@@ -327,17 +386,17 @@ def plot_heatmap(df: pd.DataFrame, collective: str, proto: str, out: Path) -> No
     ax.set_yticklabels(ranks_list)
     ax.set_xticks(np.arange(-0.5, len(sizes), 1), minor=True)
     ax.set_yticks(np.arange(-0.5, len(ranks_list), 1), minor=True)
-    ax.grid(which="minor", color=fig_facecolor, linewidth=2)
+    ax.grid(which="minor", color=_BG, linestyle="-", linewidth=2, alpha=1.0)
     ax.tick_params(which="minor", length=0)
 
     handles = [plt.Rectangle((0, 0), 1, 1, facecolor=c, edgecolor="none") for c in colors]
     legend = ax.legend(
         handles, [f"{_abbrev(a)} = {a}" for a in algos],
         loc="center left", bbox_to_anchor=(1.02, 0.5), fontsize=10,
-        facecolor=fig_facecolor, edgecolor="#333355",
+        facecolor=_BG, edgecolor="#cccccc", framealpha=0.9,
     )
     for text in legend.get_texts():
-        text.set_color("#cccccc")
+        text.set_color(_FG)
 
     fig.tight_layout()
 
@@ -353,24 +412,48 @@ def plot_heatmap(df: pd.DataFrame, collective: str, proto: str, out: Path) -> No
 
     for (yi, xi), ranked in cell_rank.items():
         runners = ranked[1 : 1 + n_runners]
+        txt = _text_color_for(color_map[ranked[0][0]])
         total = main_pt + line_pt * len(runners)
         top = total / 2.0
         ax.annotate(
             _abbrev(ranked[0][0]), (xi, yi), xytext=(0, top - main_pt / 2.0),
             textcoords="offset points", ha="center", va="center",
-            color="#10101e", fontsize=12, fontweight="bold",
+            color=txt, fontsize=12, fontweight="bold",
         )
         for k, (a, pct) in enumerate(runners):
             ax.annotate(
                 f"{_abbrev(a)} +{pct:.0f}%" if pct >= 10 else f"{_abbrev(a)} +{pct:.1f}%",
                 (xi, yi), xytext=(0, top - main_pt - line_pt * (k + 0.5)),
                 textcoords="offset points", ha="center", va="center",
-                color="#10101e", fontsize=7, alpha=0.8,
+                color=txt, fontsize=7, alpha=0.9,
             )
 
     fig.savefig(out, dpi=200, facecolor=fig_facecolor, bbox_inches="tight")
     plt.close(fig)
     ok(f"wrote {out}")
+
+
+def _algo_matches(label: str, pattern: str) -> bool:
+    """Case-insensitive. A pattern matches a label if it is the label itself, a
+    '-'-delimited prefix of it (BINE -> every BINE-*, BINE-PAT -> BINE-PAT-*),
+    or a glob (BINE-*-SEND). TREE never matches BINE-TREE."""
+    label, pattern = label.upper(), pattern.strip().upper()
+    if not pattern:
+        return False
+    if any(c in pattern for c in "*?["):
+        return fnmatchcase(label, pattern)
+    return label == pattern or label.startswith(pattern + "-")
+
+
+def filter_algos(df: pd.DataFrame, patterns: Optional[List[str]]) -> pd.DataFrame:
+    """Keep only rows whose algo label matches one of `patterns` (None = keep all)."""
+    if not patterns:
+        return df
+    present = sorted(df["algo"].unique())
+    for pat in patterns:
+        if not any(_algo_matches(a, pat) for a in present):
+            warn(f"--algo '{pat}' matches nothing (available: {', '.join(present)})")
+    return df[df["algo"].apply(lambda a: any(_algo_matches(a, p) for p in patterns))]
 
 
 def run_plot_command(
@@ -380,6 +463,7 @@ def run_plot_command(
     protos: Optional[List[str]],
     outdir: Path,
     size_filter: Optional[str] = None,
+    algos: Optional[List[str]] = None,
 ) -> None:
     outdir.mkdir(parents=True, exist_ok=True)
     for collective in collectives:
@@ -388,14 +472,18 @@ def run_plot_command(
             raise SystemExit(f"No protocols found for collective '{collective}' under {root}")
         for proto in protos_to_use:
             records = load_rank_sweep(root, collective, proto)
-            df = records_to_df(records)
+            df = filter_algos(records_to_df(records), algos)
+            if df.empty:
+                warn(f"{collective}/{proto}: no data left after --algo filter, skipping")
+                continue
+            tag = "_" + "+".join(re.sub(r"[^A-Za-z0-9_.-]", "x", a.strip()) for a in algos) if algos else ""
             if mode == "size":
-                out = outdir / f"{collective}_{proto}_scaling.png"
+                out = outdir / f"{collective}_{proto}_scaling{tag}.png"
                 plot_size(df, collective, proto, out)
             elif mode == "heatmap":
-                out = outdir / f"{collective}_{proto}_best_algo_heatmap.png"
+                out = outdir / f"{collective}_{proto}_best_algo_heatmap{tag}.png"
                 plot_heatmap(df, collective, proto, out)
             else:
                 suffix = f"_{size_filter}" if size_filter else "_by_size"
-                out = outdir / f"{collective}_{proto}_vs_ranks{suffix}.png"
+                out = outdir / f"{collective}_{proto}_vs_ranks{suffix}{tag}.png"
                 plot_ranks(df, collective, proto, out, size_filter=size_filter)
