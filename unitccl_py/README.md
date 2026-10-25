@@ -112,6 +112,13 @@ unitccl scaling --coll AllGather --algo PAT,RING,BINE --proto SIMPLE --csv --ran
 
 # Plot a rank sweep already on disk.
 unitccl plot ranks --root . --collective Bcast,AllReduce --proto SIMPLE,LL
+# ^ several protocols given explicitly => ONE combined figure per collective:
+#   `ranks`   one panel per size, color = algo, solid/filled = SIMPLE, dashed/hollow = LL, dotted = LL128
+#   `heatmap` options become <algo>-<proto> (RING-LL, RING-SIMPLE, BINE-LL128, ...)
+#   `size`    errors out (single protocol only)
+#   LL128 is NVLink-only, so it only has data for small rank counts; its lines/cells just stop there.
+#   Without --proto (autodetect) you still get one figure per protocol.
+unitccl plot heatmap --root . --collective Bcast --proto SIMPLE,LL,LL128
 unitccl plot size  --root . --collective Bcast --proto SIMPLE
 unitccl plot ranks --root . --collective AllReduce --algo BINE            # only Bine algos (-> *_BINE.png)
 unitccl plot size  --root . --collective AllReduce --algo BINE-PAT,RING    # prefix match; globs work too: 'BINE-*-SEND'
@@ -161,8 +168,8 @@ do it on a login node). To use an existing checkout instead:
 | Flag | Default | Meaning |
 |---|---|---|
 | `--coll` | all | Comma-separated: AllGather, AllReduce, Bcast, Reduce, ReduceScatter |
-| `--algo` | per-collective defaults | `NCCL_ALGO` values; the first one is the baseline of the `_diff` plot. With no `--algo` the algos flagged `True` in `config.DEFAULT_ALGOS` run; an explicit `--algo` runs exactly what you name (e.g. `PAT`, which is off by default), for collectives that list it |
-| `--proto` | SIMPLE,LL,LL128 | `NCCL_PROTO` values |
+| `--algo` | per-collective defaults | `NCCL_ALGO` values; the first one is the baseline of the `_diff` plot. With no `--algo` the algos flagged `True` in `config.DEFAULT_ALGOS` run; an explicit `--algo` runs exactly what you name (e.g. `PAT`, which is off by default), for collectives that list it. `DEFAULT` (opt-in, e.g. `--algo RING,DEFAULT`) unsets `NCCL_ALGO` so NCCL tunes the algorithm itself; it is labelled `DEFAULT` in CSVs and plots |
+| `--proto` | SIMPLE,LL,LL128 | `NCCL_PROTO` values. `DEFAULT` (opt-in, e.g. `--proto SIMPLE,DEFAULT`) unsets `NCCL_PROTO` so NCCL picks the protocol itself; it gets its own `<Coll>_DEFAULT.csv` / plots |
 | `--buffman` | none | BINE buffer management modes: `BLOCK_BY_BLOCK`, `PERMUTATION`, `DOUBLE_SEND`, `SEND` (`NCCL_BINE_BUFFER_MANAGEMENT`). `TREE` is a variant now: use `--binevar TREE` |
 | `--binevar` (alias `--variant`) | none | BINE variants `TREE`, `BUTTERFLY`, `PAT` (`NCCL_BINE_VARIANT`). Crossed with `--buffman`, except `TREE` which runs once. Rows are labelled `BINE[-<variant>][-<mode>]`, e.g. `BINE-PAT-SEND`, `BINE-TREE` |
 | `--sizes` | `1kB,16kB,256kB,1MB,4MB,64MB` | **Per-rank** message sizes, see below |

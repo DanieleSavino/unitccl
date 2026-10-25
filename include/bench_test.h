@@ -28,6 +28,12 @@ static int run_bench(const char *coll, const char *algo, size_t nbytes,
     const char *tpn = getenv("SLURM_NTASKS_PER_NODE");
     if (tpn && atoi(tpn) > 0) ppn = atoi(tpn);
 
+    /* a failed/stale previous repeat must not leak its numbers into this one */
+    out->time_ns   = 0;
+    out->avg_ns    = 0.0;
+    out->stddev_ns = 0.0;
+    out->n_iters   = 0;
+
     char cmd[512];
     snprintf(cmd, sizeof(cmd),
         "NCCL_ALGO=%s mpirun -np %d --map-by ppr:%d:node -x NCCL_ALGO "
@@ -45,14 +51,26 @@ static int run_bench(const char *coll, const char *algo, size_t nbytes,
 
     char     line[256];
     int      got_median   = 0;
+    int      got_avg      = 0;
+    int      got_stddev   = 0;
+    int      got_iters    = 0;
+    unsigned long long n_iters = 0;
     int      got_status   = 0;
     uint64_t median_ns    = 0;
+    double   avg_ns       = 0.0;
+    double   stddev_ns    = 0.0;
     int      bench_status = FASTEST_SUCCESS;
     while (fgets(line, sizeof(line), fp)) {
         fprintf(stderr, "[bench] %s", line);
         if (strncmp(line, "median:", 7) == 0) {
             got_median = 1;
             sscanf(line, "median: %llu ns", (unsigned long long *)&median_ns);
+        } else if (strncmp(line, "avg:", 4) == 0) {
+            got_avg = (sscanf(line, "avg: %lf ns", &avg_ns) == 1);
+        } else if (strncmp(line, "iters:", 6) == 0) {
+            got_iters = (sscanf(line, "iters: %llu", &n_iters) == 1);
+        } else if (strncmp(line, "stddev:", 7) == 0) {
+            got_stddev = (sscanf(line, "stddev: %lf ns", &stddev_ns) == 1);
         } else if (strncmp(line, "status:", 7) == 0) {
             got_status = 1;
             if      (strstr(line, "error assert"))    bench_status = FASTEST_ERROR_ASSERT;
@@ -66,7 +84,8 @@ static int run_bench(const char *coll, const char *algo, size_t nbytes,
         out->exit_status |= FASTEST_ERROR_RESOURCE;
         //return -1;
     }
-    if (!got_median || !got_status) {
+    /* avg/stddev/iters are mandatory: a missing line means a stale unitccl_bench binary */
+    if (!got_median || !got_avg || !got_stddev || !got_iters || !got_status) {
         out->exit_status |= FASTEST_ERROR_UNEXPECTED;
         return -1;
     }
@@ -74,7 +93,10 @@ static int run_bench(const char *coll, const char *algo, size_t nbytes,
         out->exit_status = bench_status;
         return -1;
     }
-    out->time_ns     = median_ns;
+    out->time_ns     = median_ns;   /* median of the per-iteration slowest-rank time */
+    out->avg_ns      = avg_ns;      /* mean   of the same samples */
+    out->stddev_ns   = stddev_ns;   /* population stddev of the same samples */
+    out->n_iters     = n_iters;     /* how many samples that is (needed for CIs) */
     out->exit_status = FASTEST_SUCCESS;
     return 0;
 }

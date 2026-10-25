@@ -21,8 +21,11 @@
  *       all others:    send = count,             recv = count
  *   - timing: cudaEvent pair on the single stream, all ranks sync via
  *     MPI_Barrier before each iteration so we measure the collective cleanly
- *   - stats: each rank computes its own median/min/max; rank 0 gathers and
- *     reports global median (across ranks) and true straggler (global max)
+ *   - stats: every iteration, the per-rank cudaEvent times are reduced with
+ *     MPI_MAX onto rank 0, i.e. one sample per iteration = the slowest rank of
+ *     THAT iteration (so a leaf finishing early in a tree never matters).
+ *     Rank 0 reports median / avg / stddev / min / max over those samples.
+ *     stddev is the population stddev (divide by iters), like fastest's Stats.
  *   - correctness: enabled when env UNITCCL_CHECK_BINE=1, checked on iter 0
  *     only; each rank prints "status: success|error assert|error cuda/nccl"
  */
@@ -434,6 +437,18 @@ int main(int argc, char **argv) {
         }
         printf("status:     %s\n", status_str);
 
+        /* avg / population stddev of the per-iteration slowest-rank times.
+         * Double precision, two-pass; done before the sort (order-independent). */
+        double sum_ms = 0.0;
+        for (int i = 0; i < iters; i++) sum_ms += (double)iter_stragglers_ms[i];
+        const double avg_ms = sum_ms / (double)iters;
+        double sq_ms = 0.0;
+        for (int i = 0; i < iters; i++) {
+            const double d = (double)iter_stragglers_ms[i] - avg_ms;
+            sq_ms += d * d;
+        }
+        const double stddev_ms = sqrt(sq_ms / (double)iters);
+
         qsort(iter_stragglers_ms, iters, sizeof(float), cmp_float);
         float global_median = (iters & 1)
             ? iter_stragglers_ms[iters / 2]
@@ -445,6 +460,9 @@ int main(int argc, char **argv) {
         printf("warmup:     %d  iters: %d\n", warmup, iters);
         printf("median:     %llu ns\n",
                (unsigned long long)(uint64_t)(global_median    * 1e6f));
+        printf("iters:      %d\n", iters);   /* n behind avg/stddev (for CIs) */
+        printf("avg:        %.1f ns\n", avg_ms    * 1e6);
+        printf("stddev:     %.1f ns\n", stddev_ms * 1e6);
         printf("min:        %llu ns\n",
                (unsigned long long)(uint64_t)(iter_stragglers_ms[0]       * 1e6f));
         printf("straggler:  %llu ns\n",

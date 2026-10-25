@@ -72,13 +72,14 @@ def run_profiles(
 
     outdir.mkdir(parents=True, exist_ok=True)
 
-    env: Dict[str, str] = {"NCCL_PROTO": proto, config.CHECK_ENV: "1" if check else "0"}
+    env: Dict[str, str] = {config.CHECK_ENV: "1" if check else "0"}
     if warmup is not None:
         env[config.WARMUP_ENV] = str(warmup)
     if iters is not None:
         env[config.ITERS_ENV] = str(iters)
     env.update(env_overrides or {})
     full_env = {**os.environ, **env}
+    config.apply_nccl_env(full_env, proto=proto)  # DEFAULT -> NCCL_PROTO unset
     
     bine_cfgs = config.bine_configs(binevars, buffmans)
     # PAT in the sweep -> every algo runs 1 GPU/node (same topology for all)
@@ -88,9 +89,12 @@ def run_profiles(
         for algo in algos:
             for variant, buffman in (bine_cfgs if algo == "BINE" else [(None, None)]):
                 run_env = full_env.copy()
-                run_env["NCCL_ALGO"] = algo
+                config.apply_nccl_env(run_env, algo=algo)  # DEFAULT -> NCCL_ALGO unset
                 config.apply_bine_env(run_env, variant, buffman)
                 algo_label = config.bine_label(algo, variant, buffman).lower()
+                if algo == "BINE" and not config.bine_supported(coll, proto, variant):
+                    info(f"skipping {coll} with {algo_label.upper()}: {proto} only exists for BINE-BUTTERFLY")
+                    continue
 
                 name = f"{coll.lower()}_{algo_label}_nsys"
                 info(f"profiling {coll} with {algo_label.upper()}")

@@ -25,6 +25,13 @@ PLACEHOLDER = "UNITCCL_PLACEHOLDER"
 BINE_BUFFER_MANAGEMENT_ENV = "NCCL_BINE_BUFFER_MANAGEMENT"
 BINE_VARIANT_ENV = "NCCL_BINE_VARIANT"
 
+# Pseudo-value for --algo / --proto: leave NCCL's own choice alone. The env var
+# (NCCL_ALGO / NCCL_PROTO) is *unset* for the run instead of being set, and the
+# results are labelled "DEFAULT" like any other algo / protocol in CSVs and plots.
+NCCL_ALGO_ENV = "NCCL_ALGO"
+NCCL_PROTO_ENV = "NCCL_PROTO"
+NCCL_DEFAULT = "DEFAULT"
+
 # Bine variants that ignore the buffer-management mode: they run once,
 # whatever --buffman says (PAT and BUTTERFLY have per-mode implementations).
 BUFFMAN_INDIFFERENT_VARIANTS = {"TREE"}
@@ -53,10 +60,12 @@ DEFAULT_ALGOS: Dict[str, Dict[str, bool]] = {
         "NVLS": False,
         "PAT": False,
         "BINE": True,
+        NCCL_DEFAULT: False,
     },
     "AllGatherV": {
         "RING": False,
         "BINE": False,
+        NCCL_DEFAULT: False,
     },
     "AllReduce": {
         "TREE": True,
@@ -66,19 +75,22 @@ DEFAULT_ALGOS: Dict[str, Dict[str, bool]] = {
         "NVLS": False,
         "NVLS_TREE": False,
         "BINE": True,
+        NCCL_DEFAULT: False,
     },
-    "Bcast": {"RING": True, "BINE": True},
-    "Reduce": {"RING": True, "BINE": True},
+    "Bcast": {"RING": True, "BINE": True, NCCL_DEFAULT: False},
+    "Reduce": {"RING": True, "BINE": True, NCCL_DEFAULT: False},
     "ReduceScatter": {
         "RING": True,
         "COLLNET_DIRECT": False,
         "NVLS": False,
         "PAT": False,
         "BINE": True,
+        NCCL_DEFAULT: False,
     },
 }
 
-DEFAULT_PROTOS: Dict[str, bool] = {"SIMPLE": True, "LL": True, "LL128": True}
+# DEFAULT is opt-in (`--proto SIMPLE,DEFAULT`), like the non-default algos.
+DEFAULT_PROTOS: Dict[str, bool] = {"SIMPLE": True, "LL": True, "LL128": True, NCCL_DEFAULT: False}
 
 DEFAULT_WARMUP = 10
 DEFAULT_ITERS = 40
@@ -202,6 +214,25 @@ def bine_configs(
     return out
 
 
+# LL / LL128 are only implemented for the Bine BUTTERFLY variant, and only for
+# these collectives. Bine TREE and PAT have no LL/LL128 path there, so those
+# combinations are never run (and never plotted).
+LL_PROTOS = {"LL", "LL128"}
+LL_BUTTERFLY_ONLY_COLLS = {"AllGather", "ReduceScatter", "AllReduce"}
+LL_UNSUPPORTED_BINE_VARIANTS = {"TREE", "PAT"}
+
+
+def bine_supported(coll: str, proto: str, variant: Optional[str]) -> bool:
+    """False for (BINE variant TREE|PAT) x (LL|LL128) on AllGather, ReduceScatter
+    and AllReduce. `variant` None (env var unset, default variant) is supported;
+    non-Bine algos have no variant and are always supported."""
+    return not (
+        coll in LL_BUTTERFLY_ONLY_COLLS
+        and proto in LL_PROTOS
+        and (variant or "").upper() in LL_UNSUPPORTED_BINE_VARIANTS
+    )
+
+
 def bine_label(algo: str, variant: Optional[str] = None, buffman: Optional[str] = None) -> str:
     """'BINE', 'BINE-SEND', 'BINE-TREE', 'BINE-PAT-SEND'. Non-BINE algos stay bare."""
     return "-".join(p for p in (algo, variant, buffman) if p)
@@ -214,6 +245,20 @@ def apply_bine_env(env: MutableMapping[str, str], variant: Optional[str], buffma
             env[key] = val
         else:
             env.pop(key, None)
+
+
+def apply_nccl_env(
+    env: MutableMapping[str, str], algo: Optional[str] = None, proto: Optional[str] = None
+) -> None:
+    """Set NCCL_ALGO / NCCL_PROTO on `env`; the DEFAULT pseudo-value *unsets* the
+    variable instead, so NCCL picks on its own. None leaves that variable as is."""
+    for key, val in ((NCCL_ALGO_ENV, algo), (NCCL_PROTO_ENV, proto)):
+        if val is None:
+            continue
+        if val == NCCL_DEFAULT:
+            env.pop(key, None)
+        else:
+            env[key] = val
 
 
 # ── per-algo GPUs-per-node layout ───────────────────────────────────────────

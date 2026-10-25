@@ -207,8 +207,7 @@ def _job_env(
     """Environment for one run and the names `mpirun -x` must forward."""
     env = dict(os.environ)
     env.update(extra_env or {})
-    env["NCCL_ALGO"] = algo
-    env["NCCL_PROTO"] = proto
+    config.apply_nccl_env(env, algo, proto)  # DEFAULT -> variable unset
     env.setdefault("NCCL_DEBUG", "VERSION")  # prints the NCCL version actually loaded
     config.apply_bine_env(env, variant, buffman)
     nccl_lib = config.get("nccl_lib")
@@ -376,6 +375,10 @@ def run_scaling(
             for algo in coll_algos:
                 for variant, buffman in (bine_cfgs if algo == "BINE" else [(None, None)]):
                     label = config.bine_label(algo, variant, buffman)
+                    if algo == "BINE" and not config.bine_supported(coll, proto, variant):
+                        print(color(f"   [skip] {coll} proto={proto} algo={label}: "
+                                    f"{proto} only exists for BINE-BUTTERFLY", "dim"))
+                        continue
                     print(color(f"\n  {coll}  proto={proto}  algo={label}  (nccl-tests)", "blue"))
                     if not checked_links:
                         env, _ = _job_env(algo, proto, variant, buffman, env_overrides)
@@ -389,6 +392,9 @@ def run_scaling(
                     all_failures += failures
                     frames.append(_to_frame(coll, algo, label, lo, hi, size_list, samples))
 
+            if not frames:
+                print(color(f"   [skip] {coll} proto={proto}: nothing to run", "dim"))
+                continue
             df = pd.concat(frames, ignore_index=True)
             csv_path = f"{file_dir}/{coll}_{proto}.csv"
             if merge_csv and os.path.exists(csv_path):

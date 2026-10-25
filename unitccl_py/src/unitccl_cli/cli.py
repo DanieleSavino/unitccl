@@ -8,6 +8,7 @@
     unitccl plot ranks --root . --collective Bcast,AllReduce --proto SIMPLE,LL [--size 4MB]
     unitccl plot size  --root . --collective Bcast --proto SIMPLE
     unitccl plot heatmap --root . --collective AllReduce --proto SIMPLE [--algo BINE]
+    unitccl plot size  --root . --collective Bcast --metric avg --stddev confidence
     unitccl set account <value>
     unitccl set partition <value>
     unitccl set qos <value>
@@ -205,7 +206,8 @@ def cmd_plot(args) -> None:
     protos = args.proto.split(",") if args.proto else None
     outdir = Path(args.outdir)
     plotting.run_plot_command(
-        args.mode, root, collectives, protos, outdir, size_filter=args.size, algos=_csv(args.algo)
+        args.mode, root, collectives, protos, outdir, size_filter=args.size, algos=_csv(args.algo),
+        metric=args.metric, band=args.stddev,
     )
 
 
@@ -322,7 +324,12 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("mode", choices=["ranks", "size", "heatmap"])
     sp.add_argument("--root", default=".", help="Root dir containing <N>_ranks folders")
     sp.add_argument("--collective", "--coll", dest="collective", required=True, help="Comma-separated collectives")
-    sp.add_argument("--proto", default=None, help="Comma-separated protocols (default: autodetect)")
+    sp.add_argument(
+        "--proto", default=None,
+        help="Comma-separated protocols (default: autodetect, one plot per protocol). With several given "
+        "explicitly: `ranks` overlays them in one figure (color = algo, line style = protocol), `heatmap` adds "
+        "<algo>-<proto> options, `size` is not supported",
+    )
     sp.add_argument(
         "--algo", default=None,
         help="Comma-separated algos to plot (default: all). Matches a label or its '-'-prefix, case-insensitive: "
@@ -330,6 +337,16 @@ def build_parser() -> argparse.ArgumentParser:
         "Output files get a suffix so full plots aren't overwritten",
     )
     sp.add_argument("--size", default=None, help="(mode=ranks) restrict to one message size, e.g. 4MB")
+    sp.add_argument(
+        "--metric", choices=["median", "avg"], default="median",
+        help="statistic of the per-iteration slowest-rank time to plot (default median)",
+    )
+    sp.add_argument(
+        "--stddev", choices=["stddev", "confidence"], default=None,
+        help="shade an uncertainty band around the line: 'stddev' = ±1 sample stddev over the "
+        "iterations; 'confidence' = 95%% CI of the mean, ±1.96·s/√n (default: no band). "
+        "Heatmap: cells where the winner's band overlaps the runner-up's are hatched",
+    )
     sp.add_argument("--outdir", default="plots", help="Output directory for PNGs")
     sp.set_defaults(func=cmd_plot)
 

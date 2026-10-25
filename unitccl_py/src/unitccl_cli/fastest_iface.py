@@ -128,7 +128,7 @@ def run_scaling(
             if baseline_algos is not None else coll_algos[0]
 
         for proto in active_protos:
-            os.environ["NCCL_PROTO"] = proto
+            config.apply_nccl_env(os.environ, proto=proto)  # DEFAULT -> unset
             proto_dfs = []
 
             for algo in coll_algos:
@@ -137,9 +137,15 @@ def run_scaling(
                 for variant, buffman in cfgs:
                     curr_env = dict(env_overrides or {})
                     algo_label = config.bine_label(algo, variant, buffman)
+                    if algo == "BINE" and not config.bine_supported(coll, proto, variant):
+                        print(color(f"   [skip] {coll} proto={proto} algo={algo_label}: "
+                                    f"{proto} only exists for BINE-BUTTERFLY", "dim"))
+                        continue
 
                     apply_env(check, iters, warmup, curr_env)
                     config.apply_bine_env(os.environ, variant, buffman)
+                    if algo == config.NCCL_DEFAULT:
+                        config.apply_nccl_env(os.environ, algo=algo)  # unset NCCL_ALGO
                     print(color(f"\n  {coll}  proto={proto}  algo={algo_label}", "blue"))
 
                     pool = fastest.pool_from_prefix(f"scaling/1kB_64MB/{algo}_{coll}")
