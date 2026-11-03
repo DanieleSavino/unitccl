@@ -21,8 +21,11 @@
  *       all others:    send = count,             recv = count
  *   - timing: cudaEvent pair on the single stream, all ranks sync via
  *     MPI_Barrier before each iteration so we measure the collective cleanly
- *   - stats: each rank computes its own median/min/max; rank 0 gathers and
- *     reports global median (across ranks) and true straggler (global max)
+ *   - stats: every iteration, the per-rank cudaEvent times are reduced with
+ *     MPI_MAX onto rank 0, i.e. one sample per iteration = the slowest rank of
+ *     THAT iteration (so a leaf finishing early in a tree never matters).
+ *     Rank 0 reports median / avg / stddev / min / max over those samples.
+ *     stddev is the population stddev (divide by iters), like fastest's Stats.
  *   - correctness: enabled when env UNITCCL_CHECK_BINE=1, checked on iter 0
  *     only; each rank prints "status: success|error assert|error cuda/nccl"
  */
@@ -244,11 +247,27 @@ static void check_correctness(CollType coll, size_t count,
     }
 
 done:
+    if(count <= 32 && (world_rank == 0 || coll == COLL_ALLGATHER || coll == COLL_REDUCESCATTER || coll == COLL_ALLREDUCE)) {
+        if(world_rank != 0)
+            MPI_Recv(NULL, 0, MPI_INT, world_rank - 1, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+        fprintf(stderr, "Rank %d got:\n", world_rank);
+        fprintf(stderr, "\t[");
+        for(int i = 0; i < (coll == COLL_ALLGATHER ? recv_count : count); i++) {
+            fprintf(stderr, "%.6g ", (double)h[i]);
+        }
+        fprintf(stderr, "]\n\n");
+
+        if(world_rank < world_size - 1)
+            MPI_Send(NULL, 0, MPI_INT, world_rank + 1, 0, MPI_COMM_WORLD);
+    }
+
     if (first_bad >= 0) {
         fprintf(stderr,
             "[rank %d] MISMATCH at index %d: got %.6g expected %.6g\n",
             world_rank, first_bad, (double)got_bad, (double)exp_bad);
         g_status = STATUS_ERROR_ASSERT;
+
     }
     free(h);
 }
@@ -361,6 +380,7 @@ int main(int argc, char **argv) {
     /* ── warmup ───────────────────────────────────────────────────────── */
 
     for (int iter = 0; iter < warmup; iter++) {
+	CUDA_CHECK(cudaMemset(d_recv, 0xFF, recv_bytes));   // 0xFFFFFFFF = NaN
         run_coll(coll, count, comm, stream, d_send, d_recv, world_rank);
         CUDA_CHECK(cudaStreamSynchronize(stream));
 
@@ -376,6 +396,7 @@ int main(int argc, char **argv) {
     float iter_stragglers_ms[iters];
 
     for (int iter = 0; iter < iters; iter++) {
+	CUDA_CHECK(cudaMemset(d_recv, 0xFF, recv_bytes));   // 0xFFFFFFFF = NaN
         MPI_Barrier(MPI_COMM_WORLD);
         CUDA_CHECK(cudaEventRecord(ev0, stream));
         run_coll(coll, count, comm, stream, d_send, d_recv, world_rank);
@@ -416,6 +437,18 @@ int main(int argc, char **argv) {
         }
         printf("status:     %s\n", status_str);
 
+        /* avg / population stddev of the per-iteration slowest-rank times.
+         * Double precision, two-pass; done before the sort (order-independent). */
+        double sum_ms = 0.0;
+        for (int i = 0; i < iters; i++) sum_ms += (double)iter_stragglers_ms[i];
+        const double avg_ms = sum_ms / (double)iters;
+        double sq_ms = 0.0;
+        for (int i = 0; i < iters; i++) {
+            const double d = (double)iter_stragglers_ms[i] - avg_ms;
+            sq_ms += d * d;
+        }
+        const double stddev_ms = sqrt(sq_ms / (double)iters);
+
         qsort(iter_stragglers_ms, iters, sizeof(float), cmp_float);
         float global_median = (iters & 1)
             ? iter_stragglers_ms[iters / 2]
@@ -427,6 +460,9 @@ int main(int argc, char **argv) {
         printf("warmup:     %d  iters: %d\n", warmup, iters);
         printf("median:     %llu ns\n",
                (unsigned long long)(uint64_t)(global_median    * 1e6f));
+        printf("iters:      %d\n", iters);   /* n behind avg/stddev (for CIs) */
+        printf("avg:        %.1f ns\n", avg_ms    * 1e6);
+        printf("stddev:     %.1f ns\n", stddev_ms * 1e6);
         printf("min:        %llu ns\n",
                (unsigned long long)(uint64_t)(iter_stragglers_ms[0]       * 1e6f));
         printf("straggler:  %llu ns\n",
@@ -435,7 +471,7 @@ int main(int argc, char **argv) {
 
     /* ── cleanup ──────────────────────────────────────────────────────── */
 
-    // NCCL_CHECK(ncclCommDestroy(comm));
+    //NCCL_CHECK(ncclCommDestroy(comm));
     CUDA_CHECK(cudaFree(d_send));
     CUDA_CHECK(cudaFree(d_recv));
     CUDA_CHECK(cudaStreamDestroy(stream));

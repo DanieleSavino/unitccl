@@ -1,0 +1,13 @@
+pool,test,mean_ns,stddev_ns,min_ns,max_ns,median_ns,samples_ns
+scaling/1kB_64MB/RING_AllGather,scaling/1kB_64MB/RING_AllGather/1kB,0.0,0.0,0,0,0,[0]
+scaling/1kB_64MB/RING_AllGather,scaling/1kB_64MB/RING_AllGather/16kB,0.0,0.0,0,0,0,[0]
+scaling/1kB_64MB/RING_AllGather,scaling/1kB_64MB/RING_AllGather/256kB,0.0,0.0,0,0,0,[0]
+scaling/1kB_64MB/RING_AllGather,scaling/1kB_64MB/RING_AllGather/1MB,0.0,0.0,0,0,0,[0]
+scaling/1kB_64MB/RING_AllGather,scaling/1kB_64MB/RING_AllGather/4MB,0.0,0.0,0,0,0,[0]
+scaling/1kB_64MB/RING_AllGather,scaling/1kB_64MB/RING_AllGather/64MB,0.0,0.0,0,0,0,[0]
+scaling/1kB_64MB/BINE_AllGather,scaling/1kB_64MB/BINE-BUTTERFLY-SEND_AllGather/1kB,0.0,0.0,0,0,0,[0]
+scaling/1kB_64MB/BINE_AllGather,scaling/1kB_64MB/BINE-BUTTERFLY-SEND_AllGather/16kB,0.0,0.0,0,0,0,[0]
+scaling/1kB_64MB/BINE_AllGather,scaling/1kB_64MB/BINE-BUTTERFLY-SEND_AllGather/256kB,0.0,0.0,0,0,0,[0]
+scaling/1kB_64MB/BINE_AllGather,scaling/1kB_64MB/BINE-BUTTERFLY-SEND_AllGather/1MB,0.0,0.0,0,0,0,[0]
+scaling/1kB_64MB/BINE_AllGather,scaling/1kB_64MB/BINE-BUTTERFLY-SEND_AllGather/4MB,0.0,0.0,0,0,0,[0]
+scaling/1kB_64MB/BINE_AllGather,scaling/1kB_64MB/BINE-BUTTERFLY-SEND_AllGather/64MB,0.0,0.0,0,0,0,[0]

@@ -9,23 +9,16 @@ from __future__ import annotations
 
 import importlib
 import os
+import pandas as pd
+from pathlib import Path
 from typing import Dict, List, Optional, Set
 
 import fastest
-from fastest.plotting import (
-    LegendLocation,
-    LineStyle,
-    MarkerStyle,
-    PlotMode,
-    Plotter,
-    PlotTransform,
-)
 
-from . import config
+from . import config, nodes_utils
 from .logging_utils import color, section
 
 PLOT_DIR = "plots"
-PLOT_COLORS = ["#00d2ff", "#ff6b6b", "#a8ff78", "#f7971e", "#c471ed"]
 
 
 def load_backend():
@@ -49,41 +42,23 @@ def apply_env(
         os.environ[k] = v
 
 
-def run_standalone() -> None:
+def run_standalone(
+    env_overrides: Optional[Dict[str, str]] = None,
+    buffmans: Optional[List[str]] = None,
+    binevars: Optional[List[str]] = None,
+) -> None:
     backend = load_backend()
-    section("standalone correctness")
-    for test in backend.get_subtests("standalone"):
-        fastest.run_log(test["test_name"])
 
+    for variant, buff in config.bine_configs(binevars, buffmans):
+        curr_env = dict(env_overrides or {})
+        parts = [f"VARIANT: {variant}" if variant else None, f"BUFFER MAN: {buff}" if buff else None]
+        tag = ", ".join(p for p in parts if p)
+        section(f"standalone correctness — BINE {tag}" if tag else "standalone correctness")
 
-def _make_plotter(coll: str, proto: str, tick_labels) -> Plotter:
-    p = (
-        Plotter()
-        .set_title(f"{coll} scaling — {proto}")
-        .set_x_label("Message size")
-        .set_y_label("Latency")
-        .set_x_tick_labels(tick_labels)
-        .set_bg_color("#1a1a2e")
-        .set_title_color("#e0e0e0")
-        .set_label_color("#cccccc")
-        .set_tick_color("#aaaaaa")
-        .set_line_width(2.5)
-        .set_marker(MarkerStyle.DIAMOND, size=10)
-        .set_legend(LegendLocation.UPPER_LEFT, fontsize=11)
-        .set_grid(True, color="#333355", style=LineStyle.DOTTED, alpha=0.5)
-        .show_info(False)
-        .set_dpi(200)
-    )
-    for i, c in enumerate(PLOT_COLORS):
-        p.set_pool_color(i, c)
-    return p
-
-
-def _make_diff_plotter(coll: str, proto: str, baseline_algo: str, tick_labels) -> Plotter:
-    p = _make_plotter(coll, proto, tick_labels)
-    p.set_title(f"{coll} scaling — {proto}  (Δ vs {baseline_algo})")
-    p.set_y_label(f"Δ vs {baseline_algo}")
-    return p
+        apply_env(check=True, iters=None, warmup=None, overrides=curr_env)
+        config.apply_bine_env(os.environ, variant, buff)
+        for test in backend.get_subtests("standalone"):
+            fastest.run_log(test["test_name"])
 
 
 def run_scaling(
@@ -98,6 +73,10 @@ def run_scaling(
     n_repeats: int = 1,
     plot_dir: str = PLOT_DIR,
     env_overrides: Optional[Dict[str, str]] = None,
+    buffmans: Optional[Set[str]] = None,
+    binevars: Optional[Set[str]] = None,
+    merge_csv: bool = False,
+    baseline_algos: Optional[Set[str]] = None,
     tick_labels=None,
 ) -> List[str]:
     """Port of the current `tests.py` scaling block. Returns csv paths written.
@@ -105,20 +84,29 @@ def run_scaling(
     `plot_dir` is reused both for regular runs (defaults to "plots") and for
     rank-sweep runs, where `slurm_utils.submit_rank_sweep` passes
     `<N>_ranks` so csvs land in the layout `plot.py`'s loaders expect.
+
+    For BINE, every (variant, buffman) pair from `config.bine_configs` is run
+    and labelled `BINE[-<variant>][-<buffman>]`; TREE runs once, no buffman.
+
+    `merge_csv` / `baseline_algos` are used when a sweep is split into several
+    Slurm jobs (PAT needs 1 GPU/node): the later job merges its rows into the
+    CSV the earlier one wrote, and takes the diff-plot baseline from the
+    original, unsplit algo selection.
     """
     global_rank = int(os.environ.get("SLURM_PROCID", 0))
     if global_rank != 0:
-        return
+        return []
 
     load_backend()
-    apply_env(check, iters, warmup, env_overrides or {})
-
-    tick_labels = tick_labels or ["1kB", "16kB", "256kB", "1MB", "4MB", "64MB"]
     written: List[str] = []
+    one_gpn = config.single_gpu_sweep(colls, algos)  # PAT selected -> whole sweep 1 GPU/node
 
     section("scaling comparison")
     active_colls = config.active(config.DEFAULT_COLLS, colls)
     active_protos = config.active(config.DEFAULT_PROTOS, protos)
+    bine_cfgs = config.bine_configs(
+        sorted(binevars) if binevars else None, sorted(buffmans) if buffmans else None
+    )
 
     for coll in active_colls:
         coll_algos = config.active(config.DEFAULT_ALGOS.get(coll, {}), algos)
@@ -126,35 +114,78 @@ def run_scaling(
             print(color(f"   [skip] {coll}: no active algos", "dim"))
             continue
 
-        pools = {a: fastest.pool_from_prefix(f"scaling/1kB_64MB/{a}_{coll}") for a in coll_algos}
-        baseline_algo = coll_algos[0]
+        file_dir = f"{plot_dir}/{coll}"
+        if do_csv or do_plot:
+            os.makedirs(file_dir, exist_ok=True)
+            # rank -> node map, next to the csv/plots. If PAT is in the sweep every
+            # algo runs ppr:1; otherwise ppr:<gpus_per_node>.
+            n_ranks = int(os.environ.get("SLURM_NTASKS") or os.environ.get(config.NRANKS_ENV) or 0)
+            nodes_utils.export_nodes(
+                [file_dir], n_ranks, single_gpu=one_gpn, ppn=config.get("gpus_per_node", 4)
+            )
+
+        baseline_algo = (config.active(config.DEFAULT_ALGOS.get(coll, {}), baseline_algos) or coll_algos)[0] \
+            if baseline_algos is not None else coll_algos[0]
 
         for proto in active_protos:
-            os.environ["NCCL_PROTO"] = proto
-            print(color(f"\n  {coll}  proto={proto}  algos={coll_algos}", "blue"))
+            config.apply_nccl_env(os.environ, proto=proto)  # DEFAULT -> unset
+            proto_dfs = []
 
-            cmp = fastest.compare(*pools.values(), n_repeats=n_repeats)
-            cmp.report()
+            for algo in coll_algos:
+                cfgs = bine_cfgs if algo == "BINE" else [(None, None)]
 
-            file_dir = f"{plot_dir}/{coll}"
-            if do_csv:
-                os.makedirs(file_dir, exist_ok=True)
+                for variant, buffman in cfgs:
+                    curr_env = dict(env_overrides or {})
+                    algo_label = config.bine_label(algo, variant, buffman)
+                    if algo == "BINE" and not config.bine_supported(coll, proto, variant):
+                        print(color(f"   [skip] {coll} proto={proto} algo={algo_label}: "
+                                    f"{proto} only exists for BINE-BUTTERFLY", "dim"))
+                        continue
+
+                    apply_env(check, iters, warmup, curr_env)
+                    config.apply_bine_env(os.environ, variant, buffman)
+                    if algo == config.NCCL_DEFAULT:
+                        config.apply_nccl_env(os.environ, algo=algo)  # unset NCCL_ALGO
+                    print(color(f"\n  {coll}  proto={proto}  algo={algo_label}", "blue"))
+
+                    pool = fastest.pool_from_prefix(f"scaling/1kB_64MB/{algo}_{coll}")
+                    cmp = fastest.compare(pool, n_repeats=n_repeats)
+                    cmp.report()
+
+                    tmp_csv = f"{file_dir}/.tmp_{proto}_{algo_label}.csv"
+                    cmp.save_csv(tmp_csv)
+                    df = pd.read_csv(tmp_csv)
+                    df['test'] = df['test'].str.replace(f"/{algo}_{coll}/", f"/{algo_label}_{coll}/")
+                    proto_dfs.append(df)
+                    os.remove(tmp_csv)
+
+            if proto_dfs:
+                final_df = pd.concat(proto_dfs, ignore_index=True)
                 csv_path = f"{file_dir}/{coll}_{proto}.csv"
-                cmp.save_csv(csv_path)
-                written.append(csv_path)
-                print(color(f"   saved → {csv_path}", "dim"))
+                
+                if do_csv or do_plot:
+                    if merge_csv and os.path.exists(csv_path):
+                        prev = pd.read_csv(csv_path)
+                        # new rows win over same-labelled rows from the earlier job
+                        prev = prev[~prev["test"].isin(final_df["test"])]
+                        final_df = pd.concat([prev, final_df], ignore_index=True)
+                    final_df.to_csv(csv_path, index=False)
+                    written.append(csv_path)
+                    if do_csv:
+                        print(color(f"   saved → {csv_path}", "dim"))
 
-            if do_plot:
-                os.makedirs(file_dir, exist_ok=True)
-
-                png_path = f"{file_dir}/{coll}_{proto}.png"
-                _make_plotter(coll, proto, tick_labels).plot(cmp, png_path, PlotMode.MEDIAN)
-                print(color(f"   saved → {png_path}", "dim"))
-
-                diff_path = f"{file_dir}/{coll}_{proto}_diff.png"
-                _make_diff_plotter(coll, proto, baseline_algo, tick_labels).plot(
-                    cmp, diff_path, PlotMode.MEDIAN, PlotTransform.DIFF
-                )
-                print(color(f"   saved → {diff_path}", "dim"))
+                if do_plot:
+                    from .schema import load_fastest_csv, records_to_df
+                    from .plotting import plot_size, plot_diff
+                    recs = load_fastest_csv(Path(csv_path), coll, proto, ranks=None)
+                    plot_df = records_to_df(recs)
+                    
+                    png_path = f"{file_dir}/{coll}_{proto}.png"
+                    plot_size(plot_df, coll, proto, Path(png_path))
+                    print(color(f"   saved → {png_path}", "dim"))
+                    
+                    diff_path = f"{file_dir}/{coll}_{proto}_diff.png"
+                    plot_diff(plot_df, coll, proto, Path(diff_path), baseline_algo=baseline_algo)
+                    print(color(f"   saved → {diff_path}", "dim"))
 
     return written

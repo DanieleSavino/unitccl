@@ -18,6 +18,9 @@ extern "C" {
 #endif /* ifdef BINE_MAX_STEPS */
 #define BINE_MAX_STEPS 12
 
+// send_table/recv_table are the root=0 basis tables, sized [nRanks * steps].
+// Peers for an arbitrary (root, rank, step) are obtained via
+// ncclBineTreeSend/ncclBineTreeRecv, which rotate the basis table.
 void print_tree(int *sendTable, int *recvTable, int nRanks, int steps) {
     for (int root = 0; root < nRanks; ++root) {
         printf(ANSI_BOLD "=== Root %d ===\n" ANSI_RESET, root);
@@ -32,8 +35,8 @@ void print_tree(int *sendTable, int *recvTable, int nRanks, int steps) {
         for (int rank = 0; rank < nRanks; ++rank) {
             printf(ANSI_DIM "  r%-3d |" ANSI_RESET, rank);
             for (int step = 0; step < steps; ++step) {
-                const size_t i = (size_t)root * nRanks * steps + (size_t)rank * steps + step;
-                int s = sendTable[i], r = recvTable[i];
+                int s = ncclBineTreeSend(sendTable, nRanks, steps, root, rank, step);
+                int r = ncclBineTreeRecv(recvTable, nRanks, steps, root, rank, step);
                 if (s < 0 && r < 0)
                     printf(ANSI_IDLE "   .   " ANSI_RESET);
                 else if (s >= 0 && r < 0)
@@ -54,16 +57,16 @@ FASTEST_CUSTOMTEST_INLINE("standalone/tree/recv_exactly_once", FASTEST_FAIL_ERRO
     out->exit_status = FASTEST_SUCCESS;
     for (int nranks = 4; nranks <= (4); nranks *= 2) {
         int steps = __builtin_ctz(nranks);
-        int *send_table = (int*) malloc(nranks * nranks * steps * sizeof(int));
-        int *recv_table = (int*) malloc(nranks * nranks * steps * sizeof(int));
-        ncclGetBineTreeDhlv(nranks, steps, send_table, recv_table);
+        int *send_table = (int*) malloc(nranks * steps * sizeof(int));
+        int *recv_table = (int*) malloc(nranks * steps * sizeof(int));
+        ncclGetBineTree(nranks, steps, send_table, recv_table);
 
         for (int _root = 0; _root < nranks; _root++) {
             int *recv_count = (int*) calloc(nranks, sizeof(int));
             for (int _r = 0; _r < nranks; _r++)
                 for (int _s = 0; _s < steps; _s++) {
-                    size_t i = (size_t)_root * nranks * steps + (size_t)_r * steps + _s;
-                    if (recv_table[i] >= 0) recv_count[_r]++;
+                    int rp = ncclBineTreeRecv(recv_table, nranks, steps, _root, _r, _s);
+                    if (rp >= 0) recv_count[_r]++;
                 }
             for (int _r = 0; _r < nranks; _r++) {
                 int expected = (_r == _root) ? 0 : 1;
@@ -86,20 +89,19 @@ FASTEST_CUSTOMTEST_INLINE("standalone/tree/send_recv_symmetric", FASTEST_FAIL_ER
     out->exit_status = FASTEST_SUCCESS;
     for (int nranks = 2; nranks <= (1<<BINE_MAX_STEPS); nranks *= 2) {
         int steps = __builtin_ctz(nranks);
-        int *send_table = (int*) malloc(nranks * nranks * steps * sizeof(int));
-        int *recv_table = (int*) malloc(nranks * nranks * steps * sizeof(int));
-        ncclGetBineTreeDhlv(nranks, steps, send_table, recv_table);
+        int *send_table = (int*) malloc(nranks * steps * sizeof(int));
+        int *recv_table = (int*) malloc(nranks * steps * sizeof(int));
+        ncclGetBineTree(nranks, steps, send_table, recv_table);
 
         for (int _root = 0; _root < nranks; _root++) {
             for (int _r = 0; _r < nranks; _r++) {
                 for (int _s = 0; _s < steps; _s++) {
-                    size_t i = (size_t)_root * nranks * steps + (size_t)_r * steps + _s;
-                    int peer = send_table[i];
+                    int peer = ncclBineTreeSend(send_table, nranks, steps, _root, _r, _s);
                     if (peer < 0) continue;
-                    size_t j = (size_t)_root * nranks * steps + (size_t)peer * steps + _s;
-                    if (recv_table[j] != _r) {
+                    int back = ncclBineTreeRecv(recv_table, nranks, steps, _root, peer, _s);
+                    if (back != _r) {
                         printf("  [tree/send_recv_symmetric] FAIL nranks=%d root=%d: send[%d][%d]=%d but recv[%d][%d]=%d\n",
-                               nranks, _root, _r, _s, peer, peer, _s, recv_table[j]);
+                               nranks, _root, _r, _s, peer, peer, _s, back);
                         out->exit_status = FASTEST_ERROR_ASSERT;
                         goto fail;
                     }
@@ -117,22 +119,22 @@ FASTEST_CUSTOMTEST_INLINE("standalone/tree/causal_ordering", FASTEST_FAIL_ERROR,
     out->exit_status = FASTEST_SUCCESS;
     for (int nranks = 2; nranks <= (1<<BINE_MAX_STEPS); nranks *= 2) {
         int steps = __builtin_ctz(nranks);
-        int *send_table = (int*) malloc(nranks * nranks * steps * sizeof(int));
-        int *recv_table = (int*) malloc(nranks * nranks * steps * sizeof(int));
-        ncclGetBineTreeDhlv(nranks, steps, send_table, recv_table);
+        int *send_table = (int*) malloc(nranks * steps * sizeof(int));
+        int *recv_table = (int*) malloc(nranks * steps * sizeof(int));
+        ncclGetBineTree(nranks, steps, send_table, recv_table);
 
         for (int _root = 0; _root < nranks; _root++) {
             int *recv_step = (int*) malloc(nranks * sizeof(int));
             for (int _r = 0; _r < nranks; _r++) recv_step[_r] = (_r == _root) ? -1 : steps;
             for (int _r = 0; _r < nranks; _r++)
                 for (int _s = 0; _s < steps; _s++) {
-                    size_t i = (size_t)_root * nranks * steps + (size_t)_r * steps + _s;
-                    if (recv_table[i] >= 0) { recv_step[_r] = _s; break; }
+                    int rp = ncclBineTreeRecv(recv_table, nranks, steps, _root, _r, _s);
+                    if (rp >= 0) { recv_step[_r] = _s; break; }
                 }
             for (int _r = 0; _r < nranks; _r++) {
                 for (int _s = 0; _s < steps; _s++) {
-                    size_t i = (size_t)_root * nranks * steps + (size_t)_r * steps + _s;
-                    if (send_table[i] < 0) continue;
+                    int sp = ncclBineTreeSend(send_table, nranks, steps, _root, _r, _s);
+                    if (sp < 0) continue;
                     int must_have_recv_by = (_r == _root) ? -1 : recv_step[_r];
                     if (_s <= must_have_recv_by) {
                         printf("  [tree/causal_ordering] FAIL nranks=%d root=%d r=%d: sends at step %d but recv_step=%d\n",
@@ -154,21 +156,22 @@ FASTEST_CUSTOMTEST_INLINE("standalone/tree/no_self_send", FASTEST_FAIL_ERROR, NU
     out->exit_status = FASTEST_SUCCESS;
     for (int nranks = 2; nranks <= (1<<BINE_MAX_STEPS); nranks *= 2) {
         int steps = __builtin_ctz(nranks);
-        int *send_table = (int*) malloc(nranks * nranks * steps * sizeof(int));
-        int *recv_table = (int*) malloc(nranks * nranks * steps * sizeof(int));
-        ncclGetBineTreeDhlv(nranks, steps, send_table, recv_table);
+        int *send_table = (int*) malloc(nranks * steps * sizeof(int));
+        int *recv_table = (int*) malloc(nranks * steps * sizeof(int));
+        ncclGetBineTree(nranks, steps, send_table, recv_table);
 
         for (int _root = 0; _root < nranks; _root++) {
             for (int _r = 0; _r < nranks; _r++) {
                 for (int _s = 0; _s < steps; _s++) {
-                    size_t i = (size_t)_root * nranks * steps + (size_t)_r * steps + _s;
-                    if (send_table[i] == _r) {
+                    int sp = ncclBineTreeSend(send_table, nranks, steps, _root, _r, _s);
+                    int rp = ncclBineTreeRecv(recv_table, nranks, steps, _root, _r, _s);
+                    if (sp == _r) {
                         printf("  [tree/no_self_send] FAIL nranks=%d root=%d r=%d s=%d: rank sends to itself\n",
                                nranks, _root, _r, _s);
                         out->exit_status = FASTEST_ERROR_ASSERT;
                         goto fail;
                     }
-                    if (recv_table[i] == _r) {
+                    if (rp == _r) {
                         printf("  [tree/no_self_send] FAIL nranks=%d root=%d r=%d s=%d: rank recvs from itself\n",
                                nranks, _root, _r, _s);
                         out->exit_status = FASTEST_ERROR_ASSERT;
@@ -187,17 +190,17 @@ FASTEST_CUSTOMTEST_INLINE("standalone/tree/all_ranks_reached", FASTEST_FAIL_ERRO
     out->exit_status = FASTEST_SUCCESS;
     for (int nranks = 2; nranks <= (1<<BINE_MAX_STEPS); nranks *= 2) {
         int steps = __builtin_ctz(nranks);
-        int *send_table = (int*) malloc(nranks * nranks * steps * sizeof(int));
-        int *recv_table = (int*) malloc(nranks * nranks * steps * sizeof(int));
-        ncclGetBineTreeDhlv(nranks, steps, send_table, recv_table);
+        int *send_table = (int*) malloc(nranks * steps * sizeof(int));
+        int *recv_table = (int*) malloc(nranks * steps * sizeof(int));
+        ncclGetBineTree(nranks, steps, send_table, recv_table);
 
         for (int _root = 0; _root < nranks; _root++) {
             for (int _r = 0; _r < nranks; _r++) {
                 if (_r == _root) continue;
                 bool found = false;
                 for (int _s = 0; _s < steps; _s++) {
-                    size_t i = (size_t)_root * nranks * steps + (size_t)_r * steps + _s;
-                    if (recv_table[i] >= 0) { found = true; break; }
+                    int rp = ncclBineTreeRecv(recv_table, nranks, steps, _root, _r, _s);
+                    if (rp >= 0) { found = true; break; }
                 }
                 if (!found) {
                     printf("  [tree/all_ranks_reached] FAIL nranks=%d root=%d r=%d: rank never receives\n",
@@ -217,14 +220,14 @@ FASTEST_CUSTOMTEST_INLINE("standalone/tree/root_never_recvs", FASTEST_FAIL_ERROR
     out->exit_status = FASTEST_SUCCESS;
     for (int nranks = 2; nranks <= (1<<BINE_MAX_STEPS); nranks *= 2) {
         int steps = __builtin_ctz(nranks);
-        int *send_table = (int*) malloc(nranks * nranks * steps * sizeof(int));
-        int *recv_table = (int*) malloc(nranks * nranks * steps * sizeof(int));
-        ncclGetBineTreeDhlv(nranks, steps, send_table, recv_table);
+        int *send_table = (int*) malloc(nranks * steps * sizeof(int));
+        int *recv_table = (int*) malloc(nranks * steps * sizeof(int));
+        ncclGetBineTree(nranks, steps, send_table, recv_table);
 
         for (int _root = 0; _root < nranks; _root++) {
             for (int _s = 0; _s < steps; _s++) {
-                size_t i = (size_t)_root * nranks * steps + (size_t)_root * steps + _s;
-                if (recv_table[i] >= 0) {
+                int rp = ncclBineTreeRecv(recv_table, nranks, steps, _root, _root, _s);
+                if (rp >= 0) {
                     printf("  [tree/root_never_recvs] FAIL nranks=%d root=%d s=%d: root recvs\n",
                            nranks, _root, _s);
                     out->exit_status = FASTEST_ERROR_ASSERT;
@@ -243,10 +246,10 @@ FASTEST_CUSTOMTEST_INLINE("standalone/tree/peer_differ_lsbs", FASTEST_FAIL_ERROR
     out->exit_status = FASTEST_SUCCESS;
     for (int nranks = 2; nranks <= (1<<BINE_MAX_STEPS); nranks *= 2) {
         int steps = __builtin_ctz(nranks);
-        int *send_table = (int*) malloc(nranks * nranks * steps * sizeof(int));
-        int *recv_table = (int*) malloc(nranks * nranks * steps * sizeof(int));
+        int *send_table = (int*) malloc(nranks * steps * sizeof(int));
+        int *recv_table = (int*) malloc(nranks * steps * sizeof(int));
 
-        ncclGetBineTreeDhlv(nranks, steps, send_table, recv_table);
+        ncclGetBineTree(nranks, steps, send_table, recv_table);
 
         for (int _root = 0; _root < nranks; _root++) {
             for (int _r = 0; _r < nranks; _r++) {
@@ -254,11 +257,10 @@ FASTEST_CUSTOMTEST_INLINE("standalone/tree/peer_differ_lsbs", FASTEST_FAIL_ERROR
                 int nb_vr = rank2nb(vrank, steps);
 
                 for (int _s = 0; _s < steps; _s++) {
-                    size_t i = (size_t)_root * nranks * steps + (size_t)_r * steps + _s;
                     int expected_diff = (1 << (steps - _s)) - 1;
 
-                    int s_peer = send_table[i];
-                    int r_peer = recv_table[i];
+                    int s_peer = ncclBineTreeSend(send_table, nranks, steps, _root, _r, _s);
+                    int r_peer = ncclBineTreeRecv(recv_table, nranks, steps, _root, _r, _s);
                     if (s_peer >= 0) {
                         int vpeer = (s_peer - _root + nranks) % nranks;
                         int nb_vpeer = rank2nb(vpeer, steps);

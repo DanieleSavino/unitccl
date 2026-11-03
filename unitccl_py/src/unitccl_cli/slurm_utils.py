@@ -7,13 +7,14 @@ sweep. This directly replaces hand-written per-rank-count sbatch scripts
 """
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from . import config
 from .logging_utils import info, ok
 
 import os
 import subprocess
+import sys
 
 try:
     import submitit
@@ -52,7 +53,12 @@ def apply_preload_modules(modules: List[str]) -> None:
             os.environ[k] = v
 
 
-def _executor(job_name, nodes, tasks_per_node, gpus, timeout_min, log_dir):
+def _after(job) -> Optional[Dict[str, str]]:
+    """sbatch dependency that starts after `job` ends (any state), or None."""
+    return {"dependency": f"afterany:{job.job_id}"} if job is not None else None
+
+
+def _executor(job_name, nodes, tasks_per_node, gpus, timeout_min, log_dir, extra_slurm=None):
     _require_submitit()
     executor = submitit.AutoExecutor(folder=f"{log_dir}/%j")
     params = dict(
@@ -63,6 +69,8 @@ def _executor(job_name, nodes, tasks_per_node, gpus, timeout_min, log_dir):
     )
     if gpus > 0:
         params["slurm_gres"] = f"gpu:{gpus}"
+    if extra_slurm:
+        params["slurm_additional_parameters"] = dict(extra_slurm)
 
     slurm_partition = config.get("slurm_partition")
     if slurm_partition:
@@ -75,6 +83,13 @@ def _executor(job_name, nodes, tasks_per_node, gpus, timeout_min, log_dir):
     slurm_qos = config.get("slurm_qos")
     if slurm_qos:
         params["slurm_qos"] = slurm_qos
+
+    # CPUs per task (= per GPU rank). Without this Slurm uses its default
+    # (usually 1), which can leave a rank and NCCL's proxy/helper threads
+    # competing for one core. Set with `unitccl set cpus_per_task <n>`.
+    cpus_per_task = config.get("cpus_per_task")
+    if cpus_per_task:
+        params["cpus_per_task"] = int(cpus_per_task)
 
     modules = config.get("preload_modules") or []
     setup = ["source /etc/profile"]
@@ -112,35 +127,109 @@ def submit_rank_sweep(
     timeout_min: int = 30,
     log_dir: str = "logs/sweep",
 ) -> List:
-    """Fire off one independently-sized submitit job per rank count."""
+    """Fire off one independently-sized submitit job per rank count.
+
+    If a single-GPU algo (NCCL PAT) is selected, the whole sweep (all algos)
+    runs with 1 GPU per node (nodes == ranks), so every algo is measured on
+    the same topology.
+    """
     gpus_per_node = gpus_per_node or config.get("gpus_per_node", 4)
+    groups = config.layout_groups(scaling_kwargs.get("colls"), scaling_kwargs.get("algos"))
+    split = len(groups) > 1
     jobs = []
     for ranks in ranks_list:
-        nodes = max(1, -(-ranks // gpus_per_node))  # ceil division
-        tasks_per_node = min(ranks, gpus_per_node)
-        gpus = min(ranks, gpus_per_node)
-        executor = _executor(f"unitccl-scaling-{ranks}", nodes, tasks_per_node, gpus, timeout_min, log_dir)
-        info(f"submitting ranks={ranks} nodes={nodes} gpus/node={gpus}")
-        job = executor.submit(_run_scaling_for_ranks, ranks, scaling_kwargs)
-        jobs.append(job)
+        prev = None
+        for group_algos, single in groups:
+            gpn = 1 if single else gpus_per_node
+            nodes = max(1, -(-ranks // gpn))  # ceil division
+            tasks_per_node = min(ranks, gpn)
+            gpus = min(ranks, gpn)
+            kwargs = dict(scaling_kwargs, algos=group_algos)
+            if split:
+                kwargs["baseline_algos"] = scaling_kwargs.get("algos")
+                kwargs["merge_csv"] = single  # std job writes first, PAT merges after
+            suffix = "-1gpn" if single else ""
+            executor = _executor(
+                f"unitccl-scaling-{ranks}{suffix}", nodes, tasks_per_node, gpus, timeout_min, log_dir,
+                extra_slurm=_after(prev) if single and prev else None,
+            )
+            info(f"submitting ranks={ranks} nodes={nodes} gpus/node={gpus}"
+                 + (" (PAT selected: all algos at 1 GPU/node)" if single else ""))
+            job = executor.submit(_run_scaling_for_ranks, ranks, kwargs)
+            jobs.append(job)
+            prev = job
     ok(f"submitted {len(jobs)} jobs (one right-sized alloc per rank count)")
+    return jobs
+
+
+def _run_nccltests_for_ranks(ranks: int, outdir: str, nt_kwargs: dict):
+    """Runs *inside* the submitted Slurm job: one rank count, writes csvs to
+    `<outdir>/<ranks:03d>_ranks/<coll>/<coll>_<proto>.csv`, the same layout as
+    `_run_scaling_for_ranks`. Only task 0 works; it launches mpirun itself (same
+    pattern as the nsys jobs)."""
+    if int(os.environ.get("SLURM_PROCID", 0)) != 0:
+        return []
+    from . import nccltests_utils
+
+    kwargs = dict(nt_kwargs)
+    kwargs["nranks"] = ranks
+    kwargs["plot_dir"] = f"{outdir}/{ranks:03d}_ranks"
+    overrides = dict(kwargs.get("env_overrides") or {})
+    overrides[config.NRANKS_ENV] = str(ranks)
+    kwargs["env_overrides"] = overrides
+    written = nccltests_utils.run_scaling(**kwargs)
+    info(f"ranks={ranks}: job function done, {len(written)} csv(s) written, exiting")
+    sys.stdout.flush()
+    return written
+
+
+def submit_nccltests_sweep(
+    ranks_list: List[int],
+    nt_kwargs: dict,
+    outdir: str = "plots",
+    gpus_per_node: Optional[int] = None,
+    timeout_min: int = 60,
+    log_dir: str = "logs/nccltests",
+) -> List:
+    """One independently-sized submitit job per rank count, running nccl-tests.
+    If PAT is selected the whole sweep runs 1 GPU per node (see `submit_rank_sweep`)."""
+    gpus_per_node = gpus_per_node or config.get("gpus_per_node", 4)
+    groups = config.layout_groups(nt_kwargs.get("colls"), nt_kwargs.get("algos"))
+    split = len(groups) > 1
+    jobs = []
+    for ranks in ranks_list:
+        prev = None
+        for group_algos, single in groups:
+            gpn = 1 if single else gpus_per_node
+            nodes = max(1, -(-ranks // gpn))
+            per_node = min(ranks, gpn)
+            kwargs = dict(nt_kwargs, algos=group_algos)
+            if split:
+                kwargs["baseline_algos"] = nt_kwargs.get("algos")
+                kwargs["merge_csv"] = single
+            suffix = "-1gpn" if single else ""
+            executor = _executor(
+                f"unitccl-nccltests-{ranks}{suffix}", nodes, per_node, per_node, timeout_min, log_dir,
+                extra_slurm=_after(prev) if single and prev else None,
+            )
+            info(f"submitting nccl-tests ranks={ranks} nodes={nodes} gpus/node={per_node}"
+                 + (" (PAT selected: all algos at 1 GPU/node)" if single else ""))
+            job = executor.submit(_run_nccltests_for_ranks, ranks, outdir, kwargs)
+            jobs.append(job)
+            prev = job
+    ok(f"submitted {len(jobs)} nccl-tests jobs (one right-sized alloc per rank count)")
     return jobs
 
 
 def submit_build(
     target: str,
     clean: bool = False,
-    timeout_min: int = 60,
+    timeout_min: int = 90,
     log_dir: str = "logs/build",
     gpus: int = 1,
 ) -> List:
     from pathlib import Path
-    """Submit a build (nccl/fastest/unitccl/all) on 1 GPU node.
-
-    Captures the current working directory as `root` at submit time
-    (same idea as `$SLURM_SUBMIT_DIR` in the hand-written sbatch script)
-    so the job builds the same checkout you're calling `unitccl` from.
-    """
+    """Submit a build (nccl/fastest/unitccl/all) on 1 GPU node."""
     root = Path.cwd()
     executor = _executor(f"unitccl-build-{target}", nodes=1, tasks_per_node=1, gpus=gpus, timeout_min=timeout_min, log_dir=log_dir)
     info(f"submitting build job (target={target} clean={clean})")
@@ -149,10 +238,7 @@ def submit_build(
     return [job]
 
 
-def _run_nsys_job(outdir_str, colls, algos, sizes, nranks, proto, warmup, iters, check):
-    """Runs *inside* the submitted Slurm job. Loops over all sizes within
-    this single allocation -- one nsys/stats/analyze pass per size, each
-    writing to its own `<outdir>/<size>/` subdir."""
+def _run_nsys_job(outdir_str, colls, algos, sizes, nranks, proto, warmup, iters, check, buffmans=None, env_overrides=None, binevars=None, gpus_per_node=None):
     from pathlib import Path
     from . import nsys_utils
 
@@ -161,21 +247,33 @@ def _run_nsys_job(outdir_str, colls, algos, sizes, nranks, proto, warmup, iters,
     if rank != 0:
         return
 
-    gpus_per_node = config.get("gpus_per_node", 4)
-    env_overrides = dict(os.environ)
-    env_overrides[config.NRANKS_ENV] = str(nranks)
-    env_overrides["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in range(gpus_per_node))
+    gpus_per_node = gpus_per_node or config.get("gpus_per_node", 4)
+    job_env_overrides = dict(os.environ)
+    if env_overrides:
+        job_env_overrides.update(env_overrides)
+    job_env_overrides[config.NRANKS_ENV] = str(nranks)
+    job_env_overrides["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in range(gpus_per_node))
 
     base_outdir = Path(outdir_str)
+    
+    # We pass buffmans down to nsys_utils.run_profiles so it plots all variations together
     for size in sizes:
         outdir = base_outdir / _human_size(size)
         nsys_utils.run_profiles(
             outdir, colls, algos,
             size=size, nranks=nranks, proto=proto,
-            warmup=warmup, iters=iters, check=check, env_overrides=env_overrides,
+            warmup=warmup, iters=iters, check=check, env_overrides=job_env_overrides, buffmans=buffmans,
+            binevars=binevars,
         )
         nsys_utils.generate_stats(outdir)
         nsys_utils.analyze(outdir)
+        # rank -> node map next to per_rank_metrics.csv and the plots
+        from . import nodes_utils
+        nodes_utils.export_nodes(
+            [outdir / "plots"], nranks,
+            single_gpu=any(a in config.SINGLE_GPU_ALGOS for a in algos),
+            ppn=gpus_per_node,
+        )
 
 
 def submit_nsys(
@@ -188,32 +286,31 @@ def submit_nsys(
     warmup: Optional[int] = None,
     iters: Optional[int] = None,
     check: bool = False,
+    buffmans: Optional[List[str]] = None,
+    env_overrides: Optional[Dict[str, str]] = None,
     gpus_per_node: Optional[int] = None,
     timeout_min: int = 60,
     log_dir: str = "logs/nsys",
+    binevars: Optional[List[str]] = None,
+    after=None,
+    name_suffix: str = "",
 ) -> List:
-    """One task per node, holding the full per-node GPU gres, so the
-    nested `mpirun -n nranks` inside _run_nsys_job sees the whole
-    allocation. All `sizes` are profiled sequentially within this single
-    allocation -- do NOT split per size, that would waste a fresh alloc
-    for a knob that doesn't change node/gpu requirements at all."""
     gpus_per_node = gpus_per_node or config.get("gpus_per_node", 4)
-    nodes = max(1, -(-nranks // gpus_per_node))  # ceil division
+    nodes = max(1, -(-nranks // gpus_per_node))
     executor = _executor(
-        f"unitccl-nsys-{nranks}", nodes, tasks_per_node=gpus_per_node, gpus=gpus_per_node,
-        timeout_min=timeout_min, log_dir=log_dir,
+        f"unitccl-nsys-{nranks}{name_suffix}", nodes, tasks_per_node=gpus_per_node, gpus=gpus_per_node,
+        timeout_min=timeout_min, log_dir=log_dir, extra_slurm=_after(after),
     )
     info(f"submitting nsys job nranks={nranks} nodes={nodes} gpus/node={gpus_per_node} sizes={sizes} (1 task/node)")
     job = executor.submit(
-        _run_nsys_job, str(outdir), colls, algos, sizes, nranks, proto, warmup, iters, check
+        _run_nsys_job, str(outdir), colls, algos, sizes, nranks, proto, warmup, iters, check, buffmans,
+        env_overrides, binevars, gpus_per_node,
     )
     ok("submitted 1 job")
     return [job]
 
 
 def _human_size(n: int) -> str:
-    """1048576 -> '1MB', 16777216 -> '16MB', 1024 -> '1kB'. Falls back to
-    raw byte count (e.g. '1500B') if it doesn't divide evenly."""
     n *= 4
     for unit, factor in (("GB", 1024**3), ("MB", 1024**2), ("kB", 1024)):
         if n % factor == 0:
@@ -231,58 +328,65 @@ def submit_nsys_sweep(
     warmup: Optional[int] = None,
     iters: Optional[int] = None,
     check: bool = False,
+    buffmans: Optional[List[str]] = None,
+    env_overrides: Optional[Dict[str, str]] = None,
     gpus_per_node: Optional[int] = None,
     timeout_min: int = 60,
     log_dir: str = "logs/nsys",
+    binevars: Optional[List[str]] = None,
 ) -> List:
-    """One right-sized submitit job per rank count -- all sizes are profiled
-    sequentially inside that same allocation (size doesn't change the alloc
-    shape, so splitting per-size would just waste separate allocations).
-    Sub-outdirs follow `<outdir>/<nranks>_ranks/<size>/`."""
     from pathlib import Path
+
+    gpus_per_node = gpus_per_node or config.get("gpus_per_node", 4)
+    # PAT (NCCL algo) needs 1 GPU/node -> the whole sweep runs 1 GPU/node so
+    # all algos are profiled on the same layout.
+    if any(a in config.SINGLE_GPU_ALGOS for a in algos):
+        groups = [(list(algos), 1, "-1gpn")]
+    else:
+        groups = [(list(algos), gpus_per_node, "")]
 
     jobs = []
     for nranks in ranks_list:
         sub_outdir = Path(outdir) / f"{nranks:03d}_ranks"
-        jobs.extend(
-            submit_nsys(
-                sub_outdir, colls, algos, sizes=sizes, nranks=nranks, proto=proto,
-                warmup=warmup, iters=iters, check=check,
-                gpus_per_node=gpus_per_node, timeout_min=timeout_min, log_dir=log_dir,
+        prev = None
+        for group_algos, gpn, suffix in groups:
+            new = submit_nsys(
+                sub_outdir, colls, group_algos, sizes=sizes, nranks=nranks, proto=proto,
+                warmup=warmup, iters=iters, check=check, buffmans=buffmans, env_overrides=env_overrides,
+                gpus_per_node=gpn, timeout_min=timeout_min, log_dir=log_dir,
+                binevars=binevars, after=prev if suffix else None, name_suffix=suffix,
             )
-        )
-    ok(f"submitted {len(jobs)} nsys jobs ({len(ranks_list)} rank counts, {len(sizes)} sizes each, one alloc per rank count)")
+            jobs.extend(new)
+            prev = new[-1]
+    ok(f"submitted {len(jobs)} nsys jobs ({len(ranks_list)} rank counts, {len(sizes)} sizes each, one alloc per rank count"
+       + ")")
     return jobs
 
 
-def _run_standalone_job():
-    """Runs *inside* the submitted Slurm job."""
-    from . import fastest_iface  # imported here: only needed inside the job
+def _run_standalone_job(
+    buffmans: Optional[List[str]] = None,
+    env_overrides: Optional[Dict[str, str]] = None,
+    binevars: Optional[List[str]] = None,
+):
+    from . import fastest_iface
+    fastest_iface.run_standalone(env_overrides=env_overrides, buffmans=buffmans, binevars=binevars)
 
-    fastest_iface.run_standalone()
 
-
-def submit_standalone(timeout_min: int = 30, log_dir: str = "logs/standalone") -> List:
-    """Submit `run_standalone` on a single CPU-only node/allocation."""
+def submit_standalone(
+    buffmans: Optional[List[str]] = None,
+    timeout_min: int = 30,
+    log_dir: str = "logs/standalone",
+    env_overrides: Optional[Dict[str, str]] = None,
+    binevars: Optional[List[str]] = None,
+) -> List:
     executor = _executor("unitccl-standalone", nodes=1, tasks_per_node=1, gpus=0, timeout_min=timeout_min, log_dir=log_dir)
     info("submitting standalone job (1 node, no gpu)")
-    job = executor.submit(_run_standalone_job)
+    job = executor.submit(_run_standalone_job, buffmans, env_overrides, binevars)
     ok("submitted 1 job")
     return [job]
 
 
 def wait_for(jobs: List, poll_interval: float = 2.0, tui: bool = True) -> None:
-    """Block until all jobs finish, raising if any failed.
-
-    By default renders a live dashboard (job table + scrolling log tail)
-    via `tui_utils.watch_jobs`. Pass `tui=False` for the old plain
-    `[job_id:stream] line`-per-line printing (e.g. when piping to a file
-    or running in a non-interactive CI shell).
-
-    Either way, a job that ends up CANCELLED (via the TUI's cancel keys,
-    an external `scancel`, ctrl-C, etc.) is treated as a clean stop rather
-    than a hard failure -- only a genuine FAILED/TIMEOUT/exception raises.
-    """
     if tui:
         from .tui_utils import watch_jobs
 

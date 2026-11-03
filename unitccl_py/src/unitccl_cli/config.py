@@ -12,7 +12,9 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from typing import Dict, List, Optional, Set
+from typing import Dict, Iterable, List, MutableMapping, Optional, Set, Tuple
+
+from .logging_utils import info, warn
 
 # ── env vars read by the C benchmark binary (unitccl_bench) ────────────────
 CHECK_ENV = "UNITCCL_CHECK"
@@ -20,6 +22,26 @@ ITERS_ENV = "UNITCCL_ITERS"
 WARMUP_ENV = "UNITCCL_WARMUP"
 NRANKS_ENV = "UNITCCL_NRANKS"  # informational tag set during rank sweeps
 PLACEHOLDER = "UNITCCL_PLACEHOLDER"
+BINE_BUFFER_MANAGEMENT_ENV = "NCCL_BINE_BUFFER_MANAGEMENT"
+BINE_VARIANT_ENV = "NCCL_BINE_VARIANT"
+
+# Pseudo-value for --algo / --proto: leave NCCL's own choice alone. The env var
+# (NCCL_ALGO / NCCL_PROTO) is *unset* for the run instead of being set, and the
+# results are labelled "DEFAULT" like any other algo / protocol in CSVs and plots.
+NCCL_ALGO_ENV = "NCCL_ALGO"
+NCCL_PROTO_ENV = "NCCL_PROTO"
+NCCL_DEFAULT = "DEFAULT"
+
+# Bine variants that ignore the buffer-management mode: they run once,
+# whatever --buffman says (PAT and BUTTERFLY have per-mode implementations).
+BUFFMAN_INDIFFERENT_VARIANTS = {"TREE"}
+
+# NCCL algos that only work with one GPU per node. If any of them is part of a
+# sweep, the WHOLE sweep (every algo) runs 1 GPU/node -- a right-sized Slurm
+# job (nodes == ranks) and `mpirun --map-by ppr:1:node` -- so all algos see the
+# same topology and the results are comparable.
+# Note this is the NCCL *algo* PAT, not the Bine *variant* PAT.
+SINGLE_GPU_ALGOS = {"PAT"}
 
 # ── default registries (mirrors the current tests.py) ───────────────────────
 DEFAULT_COLLS: Dict[str, bool] = {
@@ -38,10 +60,12 @@ DEFAULT_ALGOS: Dict[str, Dict[str, bool]] = {
         "NVLS": False,
         "PAT": False,
         "BINE": True,
+        NCCL_DEFAULT: False,
     },
     "AllGatherV": {
         "RING": False,
         "BINE": False,
+        NCCL_DEFAULT: False,
     },
     "AllReduce": {
         "TREE": True,
@@ -51,22 +75,29 @@ DEFAULT_ALGOS: Dict[str, Dict[str, bool]] = {
         "NVLS": False,
         "NVLS_TREE": False,
         "BINE": True,
+        NCCL_DEFAULT: False,
     },
-    "Bcast": {"RING": True, "BINE": True},
-    "Reduce": {"RING": True, "BINE": True},
+    "Bcast": {"RING": True, "BINE": True, NCCL_DEFAULT: False},
+    "Reduce": {"RING": True, "BINE": True, NCCL_DEFAULT: False},
     "ReduceScatter": {
         "RING": True,
         "COLLNET_DIRECT": False,
         "NVLS": False,
         "PAT": False,
         "BINE": True,
+        NCCL_DEFAULT: False,
     },
 }
 
-DEFAULT_PROTOS: Dict[str, bool] = {"SIMPLE": True, "LL": True, "LL128": True}
+# DEFAULT is opt-in (`--proto SIMPLE,DEFAULT`), like the non-default algos.
+DEFAULT_PROTOS: Dict[str, bool] = {"SIMPLE": True, "LL": True, "LL128": True, NCCL_DEFAULT: False}
 
 DEFAULT_WARMUP = 10
 DEFAULT_ITERS = 40
+
+# Per-rank message sizes of the `scaling/1kB_64MB` pools (bytes of the
+# per-rank `count` handed to the collective, i.e. unitccl_bench's vec_size*4).
+DEFAULT_SIZES = ["1kB", "16kB", "256kB", "1MB", "4MB", "64MB"]
 
 # ── persisted config (~/.config/unitccl/config.json) ────────────────────────
 CONFIG_DIR = Path(os.environ.get("UNITCCL_CONFIG_DIR", Path.home() / ".config" / "unitccl"))
@@ -78,7 +109,14 @@ _DEFAULTS = {
     "slurm_partition": None,
     "slurm_qos": None,
     "gpus_per_node": 4,
+    # CPUs Slurm reserves per task (one task = one GPU rank). None -> Slurm's
+    # default (usually 1). Rule of thumb: node cores / gpus_per_node
+    # (Leonardo Booster: 32 / 4 = 8). Set with `unitccl set cpus_per_task 8`.
+    "cpus_per_task": None,
     "preload_modules": [],
+    # Checkout of NVIDIA/nccl-tests (binaries live in <dir>/build). None ->
+    # <cwd>/vendor/nccl-tests. Env override: UNITCCL_NCCLTESTS_DIR.
+    "nccltests_dir": None,
 }
 
 
@@ -115,9 +153,24 @@ def get(key: str, default=None):
     return load().get(key, default)
 
 
+def nccltests_dir(root: Optional[Path] = None) -> Path:
+    """Where nccl-tests is (or will be) checked out."""
+    base = os.environ.get("UNITCCL_NCCLTESTS_DIR") or load().get("nccltests_dir")
+    return Path(base) if base else (root or Path.cwd()) / "vendor" / "nccl-tests"
+
+
 def active(d: Dict[str, bool], filter_set: Optional[Set[str]] = None) -> List[str]:
-    """Names whose flag is True, optionally restricted to `filter_set`."""
-    return [k for k, v in d.items() if v and (filter_set is None or k in filter_set)]
+    """Names to run, in registry order.
+
+    With no `filter_set` (nothing passed on the CLI): the names flagged True,
+    i.e. the defaults. With a `filter_set`: exactly the requested names that
+    exist in `d`, whatever their flag says (an explicit request overrides the
+    default set; names unknown to `d` are still dropped).
+    """
+    if filter_set is None:
+        return [k for k, v in d.items() if v]
+    return [k for k in d if k in filter_set]
+
 
 def add_preload_module(module: str) -> dict:
     """Append a module to the preload list, preserving insertion order, no dupes."""
@@ -136,3 +189,110 @@ def remove_preload_module(module: str) -> dict:
     cfg["preload_modules"] = modules
     save(cfg)
     return cfg
+
+
+# ── Bine variant x buffer-management matrix ─────────────────────────────────
+
+
+def bine_configs(
+    variants: Optional[Iterable[str]], buffmans: Optional[Iterable[str]]
+) -> List[Tuple[Optional[str], Optional[str]]]:
+    """(variant, buffman) pairs to run for the BINE algo.
+
+    None means "leave the env var unset". Variants in BUFFMAN_INDIFFERENT_VARIANTS
+    (TREE) run exactly once with no buffman; every other variant runs once per
+    buffman. e.g. variants=[PAT,TREE], buffmans=[SEND,DOUBLE_SEND] ->
+    (PAT,SEND) (PAT,DOUBLE_SEND) (TREE,None).
+    """
+    vs = list(dict.fromkeys(variants)) if variants else [None]
+    bs = list(dict.fromkeys(buffmans)) if buffmans else [None]
+    out: List[Tuple[Optional[str], Optional[str]]] = []
+    for v in vs:
+        for b in ([None] if v in BUFFMAN_INDIFFERENT_VARIANTS else bs):
+            if (v, b) not in out:
+                out.append((v, b))
+    return out
+
+
+# LL / LL128 are only implemented for the Bine BUTTERFLY variant, and only for
+# these collectives. Bine TREE and PAT have no LL/LL128 path there, so those
+# combinations are never run (and never plotted).
+LL_PROTOS = {"LL", "LL128"}
+LL_BUTTERFLY_ONLY_COLLS = {"AllGather", "ReduceScatter", "AllReduce"}
+LL_UNSUPPORTED_BINE_VARIANTS = {"TREE", "PAT"}
+
+
+def bine_supported(coll: str, proto: str, variant: Optional[str]) -> bool:
+    """False for (BINE variant TREE|PAT) x (LL|LL128) on AllGather, ReduceScatter
+    and AllReduce. `variant` None (env var unset, default variant) is supported;
+    non-Bine algos have no variant and are always supported."""
+    return not (
+        coll in LL_BUTTERFLY_ONLY_COLLS
+        and proto in LL_PROTOS
+        and (variant or "").upper() in LL_UNSUPPORTED_BINE_VARIANTS
+    )
+
+
+def bine_label(algo: str, variant: Optional[str] = None, buffman: Optional[str] = None) -> str:
+    """'BINE', 'BINE-SEND', 'BINE-TREE', 'BINE-PAT-SEND'. Non-BINE algos stay bare."""
+    return "-".join(p for p in (algo, variant, buffman) if p)
+
+
+def apply_bine_env(env: MutableMapping[str, str], variant: Optional[str], buffman: Optional[str]) -> None:
+    """Set (or clear, when None) both Bine env vars on `env`."""
+    for key, val in ((BINE_VARIANT_ENV, variant), (BINE_BUFFER_MANAGEMENT_ENV, buffman)):
+        if val:
+            env[key] = val
+        else:
+            env.pop(key, None)
+
+
+def apply_nccl_env(
+    env: MutableMapping[str, str], algo: Optional[str] = None, proto: Optional[str] = None
+) -> None:
+    """Set NCCL_ALGO / NCCL_PROTO on `env`; the DEFAULT pseudo-value *unsets* the
+    variable instead, so NCCL picks on its own. None leaves that variable as is."""
+    for key, val in ((NCCL_ALGO_ENV, algo), (NCCL_PROTO_ENV, proto)):
+        if val is None:
+            continue
+        if val == NCCL_DEFAULT:
+            env.pop(key, None)
+        else:
+            env[key] = val
+
+
+# ── per-algo GPUs-per-node layout ───────────────────────────────────────────
+
+
+def single_gpu_sweep(colls, algos) -> bool:
+    """True if the selection contains an effective SINGLE_GPU_ALGOS algo (PAT),
+    i.e. the whole sweep must run 1 GPU per node. `colls` / `algos` may be None
+    (defaults) or any iterable of names."""
+    colls = set(colls) if colls is not None else None
+    algos = set(algos) if algos is not None else None
+    return any(
+        a in SINGLE_GPU_ALGOS
+        for coll in active(DEFAULT_COLLS, colls)
+        for a in active(DEFAULT_ALGOS.get(coll, {}), algos)
+    )
+
+
+def layout_groups(
+    colls: Optional[Set[str]], algos: Optional[Set[str]]
+) -> List[Tuple[Optional[Set[str]], bool]]:
+    """Slurm layout groups: [(algo_filter, single_gpu)].
+
+    Always a single group. If a SINGLE_GPU_ALGOS algo (PAT) is effectively
+    selected, that group is 1 GPU/node and contains *all* requested algos, so
+    PAT and the others are measured on the same topology (apples to apples).
+    Otherwise it is [(algos, False)] with the configured gpus_per_node.
+    """
+    if single_gpu_sweep(colls, algos):
+        info(f"{sorted((algos or set()) & SINGLE_GPU_ALGOS)} selected: running the whole sweep "
+             "with 1 GPU per node so all algos use the same layout")
+        return [(algos, True)]
+    requested = (algos or set()) & SINGLE_GPU_ALGOS
+    if requested:
+        warn(f"{sorted(requested)} requested but not available for the selected "
+             "collectives in config.DEFAULT_ALGOS; it will be skipped")
+    return [(algos, False)]

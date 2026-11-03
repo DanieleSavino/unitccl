@@ -40,6 +40,11 @@ class BenchRecord:
     min_ns: Optional[float] = None
     max_ns: Optional[float] = None
     median_ns: Optional[float] = None
+    # per-iteration statistics of the slowest rank (see unitccl_bench.cu); absent
+    # (None/NaN) in CSVs from older runs and from nccl-tests.
+    iter_avg_ns: Optional[float] = None
+    iter_stddev_ns: Optional[float] = None   # population stddev over iter_n samples
+    iter_n: Optional[float] = None           # iterations x repeats behind avg/stddev
 
     @property
     def size_bytes(self) -> float:
@@ -50,7 +55,9 @@ def _parse_test_column(test: str):
     """'scaling/1kB_64MB/RING_Bcast/1kB' -> (algo, size_str)."""
     parts = test.split("/")
     size_str = parts[-1]
-    algo = parts[-2].split("_")[0]
+    # "<algo-label>_<Coll>": collective names never contain "_", algo labels can
+    # (e.g. "BINE-BLOCK_BY_BLOCK_AllGather"), so split from the right.
+    algo = parts[-2].rsplit("_", 1)[0]
     return algo, size_str
 
 
@@ -74,6 +81,9 @@ def load_fastest_csv(
                 min_ns=row.get("min_ns"),
                 max_ns=row.get("max_ns"),
                 median_ns=row.get("median_ns"),
+                iter_avg_ns=row.get("iter_avg_ns"),
+                iter_stddev_ns=row.get("iter_stddev_ns"),
+                iter_n=row.get("iter_n"),
             )
         )
     return out
@@ -127,6 +137,10 @@ def records_to_df(records: List[BenchRecord]) -> pd.DataFrame:
             "size_str": r.size_str,
             "size_bytes": r.size_bytes,
             "mean_ns": r.mean_ns,
+            "median_ns": r.median_ns,
+            "iter_avg_ns": r.iter_avg_ns,
+            "iter_stddev_ns": r.iter_stddev_ns,
+            "iter_n": r.iter_n,
         }
         for r in records
     ]
